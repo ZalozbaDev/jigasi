@@ -23,6 +23,9 @@ override_dh_auto_build:
 	mvn -Dmaven.repo.local=${HOME}/.m2/repository -DskipTests -Dassembly.skipAssembly=true package
 	mvn -Dmaven.repo.local=${HOME}/.m2/repository dependency:copy-dependencies -DincludeScope=runtime
 
+override_dh_builddeb:
+	dh_builddeb -- -Zgzip
+	
 override_dh_install:
 	mkdir debian/tmp
 	cp target/jigasi*.jar debian/tmp/jigasi.jar
