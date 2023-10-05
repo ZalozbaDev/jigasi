@@ -251,6 +251,8 @@ public class Transcriber
         String customTranslationServiceClass = JigasiBundleActivator.getConfigurationService()
                 .getString(CUSTOM_TRANSLATION_SERVICE_PROP, null);
 
+        logger.info("Trying to create custom translation class: " + customTranslationServiceClass);
+                
         TranslationService translationService = null;
         if (customTranslationServiceClass != null)
         {
@@ -265,6 +267,10 @@ public class Transcriber
             {
                 logger.error("Cannot instantiate custom translation service");
             }
+        }
+        else
+        {
+            logger.info("No custom translator class found!");
         }
 
         if (translationService == null)
