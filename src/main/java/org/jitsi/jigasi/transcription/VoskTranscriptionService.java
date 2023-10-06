@@ -262,8 +262,8 @@ public class VoskTranscriptionService
         {
             boolean partial = true;
             String result = "";
-            if (logger.isDebugEnabled())
-                logger.debug(debugName + "Recieved response: " + msg);
+            // if (logger.isDebugEnabled())
+            logger.info(debugName + "Recieved response: " + msg);
             JSONObject obj = new JSONObject(msg);
             if (obj.has("partial"))
             {
@@ -275,11 +275,16 @@ public class VoskTranscriptionService
                 result = obj.getString("text");
             }
 
+            logger.info(debugName + "Retrieved result: " + result + ((partial == true) ? " (partial)" : " (full)"));
+
             if (!result.isEmpty() && (!partial || !result.equals(lastResult)))
             {
                 lastResult = result;
+
                 for (TranscriptionListener l : listeners)
                 {
+                    logger.info(debugName + "Sending result uuid=" + uuid 
+                            + ((partial == true) ? " (partial)" : " (full)") + " tag=" + transcriptionTag);
                     l.notify(new TranscriptionResult(
                             null,
                             uuid,
