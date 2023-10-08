@@ -431,6 +431,8 @@ public class Participant
      */
     public String getSourceLanguage()
     {
+        logger.info(identifier + " getSourceLanguage() = " + ((sourceLanguageLocale == null) 
+          ? "null" : sourceLanguageLocale.getLanguage()));
         return sourceLanguageLocale == null ?
             null :
             sourceLanguageLocale.getLanguage();
@@ -443,6 +445,7 @@ public class Participant
      */
     public String getTranslationLanguage()
     {
+        logger.info(identifier + "getTranslationLanguage() = " + translationLanguage);
         return translationLanguage;
     }
 
@@ -461,6 +464,9 @@ public class Participant
         {
             sourceLanguageLocale = Locale.forLanguageTag(language);
         }
+
+        logger.info(identifier + "setSourceLanguage() = " + ((sourceLanguageLocale == null) 
+          ? "null" : sourceLanguageLocale.getLanguage()));
     }
 
     /**
@@ -471,6 +477,7 @@ public class Participant
     public void setTranslationLanguage(String language)
     {
         translationLanguage = language;
+        logger.info(identifier + "setTranslationLanguage() = " + translationLanguage);
     }
 
     /**
@@ -576,8 +583,8 @@ public class Participant
     public void notify(TranscriptionResult result)
     {
         result.setParticipant(this);
-        if (logger.isDebugEnabled())
-            logger.debug(result);
+        // if (logger.isDebugEnabled())
+            logger.info(identifier + " result " + result);
         transcriber.notify(result);
     }
 

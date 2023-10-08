@@ -367,6 +367,10 @@ public class Transcriber
                 TranslationLanguageExtension translationLanguageExtension
                     = presence.getExtension(TranslationLanguageExtension.class);
 
+                logger.info("Participant " + identifier + " transcriptionLanguage=" 
+                    + ((transcriptionLanguageExtension != null) 
+                        ? transcriptionLanguageExtension.getTranscriptionLanguage() : "null"));
+
                 if (transcriptionLanguageExtension != null)
                 {
                     String language
@@ -375,6 +379,10 @@ public class Transcriber
                     this.updateParticipantSourceLanguage(identifier,
                         language);
                 }
+
+                logger.info("Participant " + identifier + " translationLanguage=" 
+                    + ((translationLanguageExtension != null) 
+                        ? translationLanguageExtension.getTranslationLanguage() : "null"));
 
                 if (translationLanguageExtension != null)
                 {
