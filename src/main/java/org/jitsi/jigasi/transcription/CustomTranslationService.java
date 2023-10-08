@@ -43,6 +43,37 @@ public class CustomTranslationService
         implements TranslationService
 {
     /*
+     * Class representing the json response body from the custom translator where 
+     * response has status code 200.
+     * Used for json-to-POJO conversion with Gson.
+     */
+    class CustomTranslateResponse
+    {
+        private String output_annotatedhtml;
+    
+        private String output_word_count;
+    
+        private String output_unk_count;
+    
+        private String output_text;
+    
+        private String splitted_input_text;
+    
+        private String model;
+    
+        private String type;
+    
+        private String output_html;
+    
+        private String direction;
+      
+        public String getTranslatedText()
+        {
+            return output_text;
+        }
+    }
+
+    /*
      * The URL of the Custom API.
      */
     public final String API_URL_PROP = "org.jitsi.jigasi.transcription.customTranslate.apiurl";
@@ -78,6 +109,53 @@ public class CustomTranslationService
     {
         logger.info("Translate request: '" + sourceText + "' from " + sourceLang + " to " + targetLang);
 
-        return (sourceLang + "|" + targetLang + ": " + sourceText); 
+        if ((sourceLang.equals("hsb") && targetLang.equals("de"))
+            || (sourceLang.equals("de") && targetLang.equals("hsb")))
+        {
+            String payload = "{"
+                .concat("\"direction\": \"" + sourceLang + "_" + targetLang + "\",")
+                .concat("\"text\": \"" + sourceText + "\",")
+                .concat("\"translationtype\": \"" + "lsf" + "\",")
+                .concat("\"warnings\": \"false\"")
+                .concat("}");
+
+            logger.info("POST payload: " + payload);
+                
+            StringEntity entity = new StringEntity(payload, ContentType.APPLICATION_JSON);
+
+            HttpResponse response;
+            try (CloseableHttpClient httpClient = HttpClientBuilder.create().build())
+            {
+                HttpPost request = new HttpPost(apiUrl + apiKey);
+                request.setEntity(entity);
+                request.setHeader("Accept", "application/json");
+                request.setHeader("Content-type", "application/json");
+                response = httpClient.execute(request);
+                String jsonBody = EntityUtils.toString(response.getEntity());
+                
+                logger.info("POST response: " + jsonBody);
+                
+                int statusCode = response.getStatusLine().getStatusCode();
+                if (statusCode != 200)
+                {
+                    logger.error("Custom translator responded with status code " + statusCode + ".");
+                    logger.error(jsonBody);
+                    return "";
+                }
+                Gson gson = new GsonBuilder().create();
+                CustomTranslateResponse translateResponse = gson.fromJson(jsonBody, CustomTranslateResponse.class);
+                return translateResponse.getTranslatedText();
+            }
+            catch (IOException e)
+            {
+                logger.error("Error during request to custom translator service.");
+                logger.error(e.toString());
+                return "";
+            }
+        }
+        else
+        {
+            return (sourceLang + "|" + targetLang + ": " + sourceText);
+        }
     }
 }
