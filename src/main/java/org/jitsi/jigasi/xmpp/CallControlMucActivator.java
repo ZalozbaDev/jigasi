@@ -30,6 +30,7 @@ import org.jitsi.jigasi.util.*;
 import org.jitsi.utils.logging.Logger;
 import org.jitsi.xmpp.extensions.rayo.*;
 import org.jitsi.service.configuration.*;
+import org.jitsi.xmpp.util.*;
 import org.jivesoftware.smack.*;
 import org.jivesoftware.smack.bosh.*;
 import org.jivesoftware.smack.iqrequest.*;
@@ -249,6 +250,11 @@ public class CallControlMucActivator
      */
     @Override
     public void registrationStateChanged(RegistrationStateChangeEvent evt)
+    {
+        threadPool.execute(() -> registrationStateChangedInternal(evt));
+    }
+
+    private void registrationStateChangedInternal(RegistrationStateChangeEvent evt)
     {
         ProtocolProviderService provider = evt.getProvider();
 
@@ -589,14 +595,16 @@ public class CallControlMucActivator
                             }
                             catch(SmackException.NotConnectedException | InterruptedException e)
                             {
-                                logger.error(ctx + " Cannot send reply for dialIQ:" + packet.toXML());
+                                logger.error(
+                                        ctx + " Cannot send reply for dialIQ:"
+                                                + XmlStringBuilderUtil.toStringOpt(packet));
                             }
                         }
                     });
             }
             catch (RejectedExecutionException e)
             {
-                logger.error(ctx + " Failed to handle incoming dialIQ:" + packet.toXML());
+                logger.error(ctx + " Failed to handle incoming dialIQ:" + XmlStringBuilderUtil.toStringOpt(packet));
 
                 return IQ.createErrorResponse(packet, StanzaError.getBuilder()
                     .setCondition(internal_server_error)
@@ -611,7 +619,7 @@ public class CallControlMucActivator
         {
             if (logger.isDebugEnabled())
             {
-                logger.debug(ctx + " Processing a RayoIq: " + packet.toXML());
+                logger.debug(ctx + " Processing a RayoIq: " + XmlStringBuilderUtil.toStringOpt(packet));
             }
 
             try
