@@ -18,3 +18,4 @@ java -cp ${CLASSPATH} org.jitsi.jigasi.transcription.CustomLocalCTranslationServ
 
 echo "============================================================="
 
+java -cp ${CLASSPATH} org.jitsi.jigasi.transcription.CustomLocalLMUTranslationService "http://localhost:3000/translate" DUMMY

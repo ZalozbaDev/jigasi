@@ -49,27 +49,23 @@ public class CustomLocalLMUTranslationService
      */
     class CustomTranslateResponse
     {
-        private String output_annotatedhtml;
+        private String ctranslate2_input;
     
-        private String output_word_count;
+        private String ctranslate2_output;
     
-        private String output_unk_count;
+        private String marked_input;
     
-        private String output_text;
-    
-        private String splitted_input_text;
+        private String marked_translation;
     
         private String model;
     
-        private String type;
+        private boolean ok;
     
-        private String output_html;
+        private String translation;
     
-        private String direction;
-      
         public String getTranslatedText()
         {
-            return output_text;
+            return translation;
         }
     }
 
@@ -120,10 +116,9 @@ public class CustomLocalLMUTranslationService
             || (sourceLang.equals("de") && targetLang.equals("hsb")))
         {
             String payload = "{"
-                .concat("\"direction\": \"" + sourceLang + "_" + targetLang + "\",")
-                .concat("\"text\": \"" + sourceText + "\",")
-                .concat("\"translationtype\": \"" + "lsf" + "\",")
-                .concat("\"warnings\": \"false\"")
+                .concat("\"source_language\": \"" + sourceLang + "\",")
+                .concat("\"target_language\": \"" + targetLang + "\",")
+                .concat("\"text\": \"" + sourceText + "\"")
                 .concat("}");
 
             logger.info("POST payload: " + payload);
@@ -133,7 +128,7 @@ public class CustomLocalLMUTranslationService
             HttpResponse response;
             try (CloseableHttpClient httpClient = HttpClientBuilder.create().build())
             {
-                HttpPost request = new HttpPost(apiUrl + apiKey);
+                HttpPost request = new HttpPost(apiUrl);
                 request.setEntity(entity);
                 request.setHeader("Accept", "application/json");
                 request.setHeader("Content-type", "application/json");
