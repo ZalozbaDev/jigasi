@@ -39,7 +39,7 @@ import java.io.IOException;
  * for more information about the custom API
  * @author Daniel Zoba
  */
-public class CustomTranslationService
+public class CustomRemoteTranslationService
         implements TranslationService
 {
     /*
@@ -88,9 +88,9 @@ public class CustomTranslationService
 
     private final String apiKey;
 
-    private final Logger logger = Logger.getLogger(CustomTranslationService.class);
+    private final Logger logger = Logger.getLogger(CustomRemoteTranslationService.class);
 
-    public CustomTranslationService()
+    public CustomRemoteTranslationService()
     {
         apiUrl = JigasiBundleActivator.getConfigurationService().getString(API_URL_PROP, DEFAULT_API_URL);
 
@@ -101,7 +101,7 @@ public class CustomTranslationService
         logger.info("Custom translator API KEY: " + apiKey);
     }
 
-    public CustomTranslationService(String apiUrl, String apiKey)
+    public CustomRemoteTranslationService(String apiUrl, String apiKey)
     {
         // purely for testing
         this.apiUrl = apiUrl;
@@ -172,7 +172,7 @@ public class CustomTranslationService
         
         String res;
         
-        CustomTranslationService cts = new CustomTranslationService(args[0], args[1]);
+        CustomRemoteTranslationService cts = new CustomRemoteTranslationService(args[0], args[1]);
         res = cts.translate("Witajće k nam!", "hsb", "de");
         System.out.println("hsb-->de: " + res);
         res = cts.translate("Willkommen in Bautzen!", "de", "hsb");
