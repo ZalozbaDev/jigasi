@@ -8,6 +8,13 @@ CLASSPATH=${CLASSPATH}:../.m2/repository/commons-logging/commons-logging/1.2/com
 # CLASSPATH=${CLASSPATH}:../.m2/repository/com/google/http-client/google-http-client-gson/1.41.7/google-http-client-gson-1.41.7.jar
 CLASSPATH=${CLASSPATH}:../.m2/repository/com/google/code/gson/gson/2.9.0/gson-2.9.0.jar
 
+echo "============================================================="
+
 java -cp ${CLASSPATH} org.jitsi.jigasi.transcription.CustomRemoteTranslationService $1 $2
 
+echo "============================================================="
+
+java -cp ${CLASSPATH} org.jitsi.jigasi.transcription.CustomLocalCTranslationService "http://localhost:5000/translate" DUMMY
+
+echo "============================================================="
 
