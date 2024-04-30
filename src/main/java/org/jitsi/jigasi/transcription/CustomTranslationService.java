@@ -101,6 +101,13 @@ public class CustomTranslationService
         logger.info("Custom translator API KEY: " + apiKey);
     }
 
+    public CustomTranslationService(String apiUrl, String apiKey)
+    {
+        // purely for testing
+        this.apiUrl = apiUrl;
+        this.apiKey = apiKey;
+    }
+
     /**
      * {@inheritDoc}
      */
@@ -157,5 +164,18 @@ public class CustomTranslationService
         {
             return (sourceLang + "|" + targetLang + ": " + sourceText);
         }
+    }
+    
+    public static void main(String[] args)
+    {
+        System.out.println("Hello world custom translator test! API URL='" + args[0] + "', API KEY='" + args[1] + "'.");
+        
+        String res;
+        
+        CustomTranslationService cts = new CustomTranslationService(args[0], args[1]);
+        res = cts.translate("Witajće k nam!", "hsb", "de");
+        System.out.println("hsb-->de: " + res);
+        res = cts.translate("Willkommen in Bautzen!", "de", "hsb");
+        System.out.println("de-->hsb: " + res);
     }
 }
