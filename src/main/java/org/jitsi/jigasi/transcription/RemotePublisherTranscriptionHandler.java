@@ -17,8 +17,8 @@
  */
 package org.jitsi.jigasi.transcription;
 
-import net.java.sip.communicator.service.protocol.*;
-import org.json.*;
+import org.jitsi.jigasi.*;
+import org.json.simple.*;
 
 import java.util.*;
 
@@ -55,7 +55,7 @@ public class RemotePublisherTranscriptionHandler
     }
 
     @Override
-    public void publish(ChatRoom room, TranscriptionResult result)
+    public void publish(JvbConference jvbConference, TranscriptionResult result)
     {
         if (result.isInterim())
             return;

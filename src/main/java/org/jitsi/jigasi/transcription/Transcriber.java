@@ -17,13 +17,13 @@
  */
 package org.jitsi.jigasi.transcription;
 
-import com.timgroup.statsd.*;
 import net.java.sip.communicator.impl.protocol.jabber.*;
 import net.java.sip.communicator.service.protocol.*;
 import org.jitsi.impl.neomedia.device.*;
 import org.jitsi.jigasi.*;
+import org.jitsi.jigasi.stats.*;
 import org.jitsi.jigasi.transcription.action.*;
-import org.jitsi.utils.logging.*;
+import org.jitsi.utils.logging2.*;
 import org.jitsi.xmpp.extensions.jitsimeet.*;
 import org.jivesoftware.smack.packet.*;
 
@@ -45,22 +45,7 @@ public class Transcriber
     /**
      * The logger of this class
      */
-    private final static Logger logger = Logger.getLogger(Transcriber.class);
-
-    /**
-     * Datadog aspect for failing the transcription process.
-     */
-    private final static String DD_ASPECT_FAILED = "failed_transcriber";
-
-    /**
-     * Datadog aspect for starting transcribing
-     */
-    private final static String DD_ASPECT_START = "start_transcriber";
-
-    /**
-     * Datadog aspect for ending transcribing
-     */
-    private final static String DD_ASPECT_STOP = "stop_transcriber";
+    private final Logger logger;
 
     /**
      * The property name for the boolean value whether translations should be
@@ -197,24 +182,33 @@ public class Transcriber
     private boolean filterSilence;
 
     /**
+     * The call context.
+     */
+    final private CallContext context;
+
+    /**
      * Create a transcription object which can be used to add and remove
      * participants of a conference to a list of audio streams which will
      * be transcribed.
      *
      * @param roomName the room name the transcription will take place in
      * @param roomUrl the url of the conference being transcribed
-     * @param service the transcription service which will be used to transcribe
-     * the audio streams
+     * @param service the transcription service which will be used to transcribe the audio streams
+     * @param context  the call context.
      */
     public Transcriber(String roomName,
                        String roomUrl,
-                       AbstractTranscriptionService service)
+                       AbstractTranscriptionService service,
+                       CallContext context,
+                       Logger parentLogger)
     {
+        this.logger = parentLogger.createChildLogger(Transcriber.class.getName());
+        this.context = context;
+
         if (!service.supportsStreamRecognition())
         {
             throw new IllegalArgumentException(
-                    "Currently only services which support streaming "
-                    + "recognition are supported");
+                "Currently only services which support streaming recognition are supported");
         }
         this.transcriptionService = service;
         addTranscriptionListener(this.transcript);
@@ -237,9 +231,9 @@ public class Transcriber
      * @param service the transcription service which will be used to transcribe
      * the audio streams
      */
-    public Transcriber(AbstractTranscriptionService service)
+    public Transcriber(AbstractTranscriptionService service, CallContext context, Logger parentLogger)
     {
-        this(null, null, service);
+        this(null, null, service, context, parentLogger);
     }
 
     /**
@@ -282,16 +276,6 @@ public class Transcriber
     }
 
     /**
-     * A debug name added to every log message printed by this instance.
-     *
-     * @return a {@code String}
-     */
-    private String getDebugName()
-    {
-        return roomName;
-    }
-
-    /**
      * Add a participant to the list of participants being transcribed
      *
      * @param identifier the identifier of the participant
@@ -311,16 +295,12 @@ public class Transcriber
             }
 
             if (logger.isDebugEnabled())
-                logger.debug(
-                    getDebugName()
-                        + ": added participant with identifier " + identifier);
+                logger.debug("added participant with identifier " + identifier);
 
             return;
         }
 
-        logger.warn(
-            getDebugName() + ": participant with identifier " + identifier
-                +  " joined while it did not exist");
+        logger.warn("participant with identifier " + identifier + " joined while it did not exist");
 
     }
 
@@ -395,10 +375,8 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": asked to set chatroom member of participant"
-                    + " with identifier " + identifier
-                    + " while it wasn't added before");
+            logger.warn("asked to set chatroom member of participant with identifier " + identifier
+                + " while it wasn't added before");
         }
     }
 
@@ -487,19 +465,29 @@ public class Transcriber
             }
 
             if (logger.isDebugEnabled())
-            {
-                logger.debug(
-                    getDebugName() + ": removed participant with identifier "
-                        + identifier);
-            }
+                logger.debug("removed participant with identifier " + identifier);
 
             return;
         }
 
-        logger.warn(
-            getDebugName() + ": participant with identifier "
-                + identifier +  " left while it did not exist");
+        logger.warn("participant with identifier " + identifier +  " left while it did not exist");
     }
+
+    /**
+     * Flush the audio buffer of a participant.
+     *
+     * @param identifier the identifier of the participant
+     */
+    public void flushParticipantAudioBuffer(String identifier)
+    {
+        Participant participant = getParticipant(identifier);
+        if (participant != null)
+        {
+            participant.flushBuffer();
+        }
+    }
+
+
 
     /**
      * Start transcribing all participants added to the list
@@ -509,9 +497,9 @@ public class Transcriber
         if (State.NOT_STARTED.equals(this.state))
         {
             if (logger.isDebugEnabled())
-                logger.debug(getDebugName() + ": transcriber is now transcribing");
+                logger.debug("transcriber is now transcribing");
 
-            updateDDClient(DD_ASPECT_START);
+            Statistics.incrementTotalTranscriberStarted();
 
             this.state = State.TRANSCRIBING;
             this.executorService = Executors.newSingleThreadExecutor();
@@ -525,9 +513,7 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": trying to start Transcriber while it is"
-                    + " already started");
+            logger.warn("trying to start Transcriber while it is already started");
         }
     }
 
@@ -540,10 +526,7 @@ public class Transcriber
         if (State.TRANSCRIBING.equals(this.state))
         {
             if (logger.isDebugEnabled())
-                logger.debug(
-                    getDebugName() + ": transcriber is now finishing up");
-
-            updateDDClient(reason == null ? DD_ASPECT_STOP : DD_ASPECT_FAILED);
+                logger.debug("transcriber is now finishing up");
 
             this.state = reason == null ? State.FINISHING_UP : State.FINISHED;
             this.executorService.shutdown();
@@ -555,10 +538,14 @@ public class Transcriber
 
             if (reason == null)
             {
+                Statistics.incrementTotalTranscriberSopped();
+
                 checkIfFinishedUp();
             }
             else
             {
+                Statistics.incrementTotalTranscriberFailed();
+
                 for (TranscriptionListener listener : listeners)
                 {
                     listener.failed(reason);
@@ -567,27 +554,7 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": trying to stop Transcriber while it is "
-                    + " already stopped");
-        }
-    }
-
-    /**
-     * Updated dd client with a stat.
-     *
-     * @param ddAspectStop
-     */
-    private void updateDDClient(String ddAspectStop)
-    {
-        StatsDClient dClient = JigasiBundleActivator.getDataDogClient();
-        if (dClient != null)
-        {
-            dClient.increment(ddAspectStop);
-            if (logger.isDebugEnabled())
-            {
-                logger.debug(getDebugName() + " thrown stat: " + ddAspectStop);
-            }
+            logger.warn("trying to stop Transcriber while it is already stopped");
         }
     }
 
@@ -605,9 +572,7 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": trying to notify Transcriber for a while"
-                    + " it is already stopped");
+            logger.warn("trying to notify Transcriber for a while it is already stopped");
         }
     }
 
@@ -734,8 +699,9 @@ public class Transcriber
     {
         if (!isTranscribing())
         {
-            logger.trace(
-                getDebugName() + ": receiving audio while not transcribing");
+            if (logger.isTraceEnabled())
+                logger.trace("receiving audio while not transcribing");
+
             return;
         }
 
@@ -747,15 +713,15 @@ public class Transcriber
         {
             if (p.hasValidSourceLanguage())
             {
-                logger.trace(getDebugName() + ": gave audio to buffer");
+                if (logger.isTraceEnabled())
+                    logger.trace("gave audio to buffer");
+
                 p.giveBuffer(buffer);
             }
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": reading from SSRC " + ssrc
-                    + " while it is not known as a participant");
+            logger.warn("reading from SSRC " + ssrc + " while it is not known as a participant");
         }
     }
 
@@ -804,10 +770,7 @@ public class Transcriber
      */
     public boolean isAnyParticipantRequestingTranscription()
     {
-
-        return getParticipants()
-            .stream()
-            .anyMatch(Participant::isRequestingTranscription);
+        return getParticipants().stream().anyMatch(Participant::isRequestingTranscription);
     }
 
     /**
@@ -851,16 +814,16 @@ public class Transcriber
                 {
                     if (!participant.isCompleted())
                     {
-                        logger.debug(
-                            participant.getDebugName()
-                                + " is still not finished");
+                        if (logger.isDebugEnabled())
+                            logger.debug("is still not finished");
+
                         return;
                     }
                 }
             }
 
             if (logger.isDebugEnabled())
-                logger.debug(getDebugName() + ": transcriber is now finished");
+                logger.debug("transcriber is now finished");
 
             this.state = State.FINISHED;
             for (TranscriptionListener listener : listeners)
@@ -876,6 +839,14 @@ public class Transcriber
     public TranscriptionService getTranscriptionService()
     {
         return transcriptionService;
+    }
+
+    /**
+     * @return the {@link TranslationManager}.
+     */
+    public TranslationManager getTranslationManager()
+    {
+        return this.translationManager;
     }
 
     /**
@@ -967,5 +938,15 @@ public class Transcriber
         return JigasiBundleActivator.getConfigurationService()
             .getBoolean(P_NAME_FILTER_SILENCE, FILTER_SILENCE_DEFAULT_VALUE)
             && !this.transcriptionService.disableSilenceFilter();
+    }
+
+    /**
+     * Retrieves the current call context.
+     *
+     * @return the current CallContext instance associated with this object
+     */
+    public CallContext getCallContext()
+    {
+        return this.context;
     }
 }

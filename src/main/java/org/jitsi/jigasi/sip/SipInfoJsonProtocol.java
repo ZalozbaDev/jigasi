@@ -65,6 +65,8 @@ public class SipInfoJsonProtocol
         public static final int AV_MODERATION_APPROVED = 9;
         public static final int AV_MODERATION_DENIED = 10;
         public static final int SIP_CALL_HEARTBEAT = 11;
+        public static final int SIP_CALL_VISITOR = 12;
+        public static final int SIP_CALL_IS_LIVE = 15;
     }
 
     private static class MESSAGE_HEADER
@@ -296,7 +298,7 @@ public class SipInfoJsonProtocol
     }
 
     /**
-     * Creates new JSONObject for sip call heartbeat..
+     * Creates new JSONObject for sip call heartbeat.
      *
      * @return JSONObject representing a message to be sent over SIP.
      */
@@ -305,6 +307,36 @@ public class SipInfoJsonProtocol
         JSONObject obj = new JSONObject();
 
         obj.put(MESSAGE_HEADER.MESSAGE_TYPE, MESSAGE_TYPE.SIP_CALL_HEARTBEAT);
+
+        return obj;
+    }
+
+    /**
+     * Creates new JSONObject for sip call visitors.
+     *
+     * @return JSONObject representing a message to be sent over SIP.
+     */
+    public static JSONObject createSIPCallVisitors(boolean enabled)
+    {
+        JSONObject obj = new JSONObject();
+
+        obj.put(MESSAGE_HEADER.MESSAGE_TYPE, MESSAGE_TYPE.SIP_CALL_VISITOR);
+        obj.put(MESSAGE_HEADER.MESSAGE_DATA, enabled);
+
+        return obj;
+    }
+
+    /**
+     * Creates new JSONObject for call that is not live.
+     *
+     * @return JSONObject representing a message to be sent over SIP.
+     */
+    public static JSONObject createSIPCallLive(boolean live)
+    {
+        JSONObject obj = new JSONObject();
+
+        obj.put(MESSAGE_HEADER.MESSAGE_TYPE, MESSAGE_TYPE.SIP_CALL_IS_LIVE);
+        obj.put(MESSAGE_HEADER.MESSAGE_DATA, live);
 
         return obj;
     }

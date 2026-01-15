@@ -17,41 +17,58 @@
  */
 package org.jitsi.jigasi.transcription;
 
-import io.jsonwebtoken.*;
+import com.fasterxml.uuid.*;
 import org.eclipse.jetty.websocket.api.*;
 import org.eclipse.jetty.websocket.api.annotations.*;
 import org.eclipse.jetty.websocket.client.*;
 import org.jitsi.jigasi.*;
-import org.jitsi.utils.logging.*;
-import org.json.*;
+import org.jitsi.jigasi.stats.*;
+import org.jitsi.jigasi.util.Util;
+import org.jitsi.utils.logging2.*;
+import org.json.simple.*;
+import org.json.simple.parser.*;
 
 import java.io.*;
 import java.net.*;
 import java.nio.*;
-import java.security.*;
-import java.security.spec.*;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.*;
 
-
+/**
+ * This holds the websocket that is used to send audio data to the Whisper.
+ * This is one WhisperWebsocket per room.
+ * The jetty WebSocketClient process messages in a single thread.
+ */
 @WebSocket
 public class WhisperWebsocket
 {
+    private final static Logger classLogger = new LoggerImpl(WhisperWebsocket.class.getName());
+
     private Session wsSession;
 
     private Map<String, Participant> participants = new ConcurrentHashMap<>();
 
     private Map<String, Set<TranscriptionListener>> participantListeners = new ConcurrentHashMap<>();
 
-    private static final int maxRetryAttempts = 10;
+    private Map<String, Instant> participantTranscriptionStarts = new ConcurrentHashMap<>();
+
+    private Map<String, UUID> participantTranscriptionIds= new ConcurrentHashMap<>();
+
+    private static final int maxRetryAttempts = 3;
 
 
-    /* Transcription language requested by the user who requested the transcription */
+    /* Transcription language requested by the user who started the transcription */
     public String transcriptionTag = "en-US";
 
-    private final static Logger logger
-            = Logger.getLogger(WhisperWebsocket.class);
+    private final Logger logger;
+
+    /**
+     * JWT audience for the Whisper service.
+     */
+    public final static String JWT_AUDIENCE
+            = "org.jitsi.jigasi.transcription.whisper.jwt_audience";
 
     /**
      * The config key of the websocket to the speech-to-text service.
@@ -82,7 +99,7 @@ public class WhisperWebsocket
      * The config value of the websocket to the speech-to-text
      * service.
      */
-    private String websocketUrlConfig;
+    private final static String websocketUrlConfig;
 
     /**
      * The URL of the websocket to the speech-to-text service.
@@ -94,27 +111,56 @@ public class WhisperWebsocket
      */
     private final String connectionId = UUID.randomUUID().toString();
 
-    private String privateKey;
+    private final static String privateKey;
 
-    private String privateKeyName;
+    private final static String privateKeyName;
 
+    private final static String jwtAudience;
 
-    private String getJWT() throws NoSuchAlgorithmException, InvalidKeySpecException
+    private WebSocketClient ws;
+
+    private boolean reconnecting = false;
+
+    private final static long CONNECTION_TIMEOUT_MS = 15000L;
+
+    static
     {
-        long nowMillis = System.currentTimeMillis();
-        Date now = new Date(nowMillis);
-        KeyFactory kf = KeyFactory.getInstance("RSA");
-        PKCS8EncodedKeySpec keySpecPKCS8 = new PKCS8EncodedKeySpec(Base64.getDecoder().decode(privateKey));
-        PrivateKey finalPrivateKey = kf.generatePrivate(keySpecPKCS8);
-        JwtBuilder builder = Jwts.builder()
-                .setHeaderParam("kid", privateKeyName)
-                .setIssuedAt(now)
-                .setIssuer("jigasi")
-                .signWith(finalPrivateKey, SignatureAlgorithm.RS256);
-        long expires = nowMillis + (60 * 5 * 1000);
-        Date expiry = new Date(expires);
-        builder.setExpiration(expiry);
-        return builder.compact();
+        jwtAudience = JigasiBundleActivator.getConfigurationService()
+                .getString(JWT_AUDIENCE, "jitsi");
+        privateKey = JigasiBundleActivator.getConfigurationService()
+                .getString(PRIVATE_KEY, "");
+        privateKeyName = JigasiBundleActivator.getConfigurationService()
+                .getString(PRIVATE_KEY_NAME, "");
+        if (privateKey.isEmpty() || privateKeyName.isEmpty())
+        {
+            classLogger.warn("org.jitsi.jigasi.transcription.whisper.private_key_name or " +
+                    "org.jitsi.jigasi.transcription.whisper.private_key are empty." +
+                    "Will not generate a JWT for skynet/streaming-whisper.");
+        }
+
+        String wsUrlConfig = JigasiBundleActivator.getConfigurationService()
+                .getString(WEBSOCKET_URL, DEFAULT_WEBSOCKET_URL);
+        if (wsUrlConfig.endsWith("/"))
+        {
+            websocketUrlConfig = wsUrlConfig.substring(0, wsUrlConfig.length() - 1);
+        }
+        else
+        {
+            websocketUrlConfig = wsUrlConfig;
+        }
+        classLogger.info("Websocket transcription streaming endpoint: " + websocketUrlConfig);
+    }
+
+    /**
+     * The thread pool to serve all connect, disconnect ore reconnect operations.
+     */
+    private static final ExecutorService threadPool = Util.createNewThreadPool("jigasi-whisper-ws");
+
+    private final JSONParser jsonParser = new JSONParser();
+
+    public WhisperWebsocket(Logger parentLogger)
+    {
+        logger = parentLogger.createChildLogger(WhisperWebsocket.class.getName());
     }
 
     /**
@@ -123,115 +169,213 @@ public class WhisperWebsocket
      */
     private void generateWebsocketUrl()
     {
-        getConfig();
-        try
-        {
-            websocketUrl = websocketUrlConfig + "/" + connectionId + "?auth_token=" + getJWT();
-        }
-        catch (Exception e)
-        {
-            logger.error("Failed generating JWT for Whisper. " + e);
-        }
+        websocketUrl = websocketUrlConfig + "/" + connectionId;
         if (logger.isDebugEnabled())
         {
-            logger.debug("Whisper URL: " + websocketUrl);
+            logger.debug(" Whisper URL: " + websocketUrl);
         }
     }
 
-    private void getConfig()
+    /**
+     * Connect to the websocket in a new thread so we do not block Smack.
+     */
+    void connect()
     {
-        websocketUrlConfig = JigasiBundleActivator.getConfigurationService()
-                .getString(WEBSOCKET_URL, DEFAULT_WEBSOCKET_URL);
-        if (websocketUrlConfig.endsWith("/"))
-        {
-            websocketUrlConfig = websocketUrlConfig.substring(0, websocketUrlConfig.length() - 1);
-        }
-        privateKey = JigasiBundleActivator.getConfigurationService()
-                        .getString(PRIVATE_KEY, "");
-        privateKeyName = JigasiBundleActivator.getConfigurationService()
-                .getString(PRIVATE_KEY_NAME, "");
-        logger.info("Websocket streaming endpoint: " + websocketUrlConfig);
+        threadPool.submit(this::connectInternal);
     }
 
     /**
      * Connect to the websocket, retry up to maxRetryAttempts
      * with exponential backoff in case of failure
      */
-    void connect()
+    private void connectInternal()
     {
         int attempt = 0;
         float multiplier = 1.5f;
         long waitTime = 1000L;
         boolean isConnected = false;
         wsSession = null;
-        while (attempt < maxRetryAttempts && !isConnected)
+        WebSocketClient localWs = null;
+        // avoid executing if meeting ended (we are not running) while we were reconnecting
+        while (attempt < maxRetryAttempts && !(reconnecting && !isRunning()) && !isConnected)
         {
             try
             {
                 generateWebsocketUrl();
                 logger.info("Connecting to " + websocketUrl);
-                WebSocketClient ws = new WebSocketClient();
-                ws.start();
-                CompletableFuture<Session> connectFuture = ws.connect(this, new URI(websocketUrl));
-                wsSession = connectFuture.get();
+                ClientUpgradeRequest upgradeRequest = new ClientUpgradeRequest();
+                if (!privateKey.isEmpty() && !privateKeyName.isEmpty())
+                {
+                    upgradeRequest.setHeader("Authorization", "Bearer " +
+                        Util.generateAsapToken(privateKey, privateKeyName, jwtAudience, "jigasi"));
+                }
+                localWs = new WebSocketClient();
+                localWs.start();
+                CompletableFuture<Session> futureSession = localWs.connect(this, new URI(websocketUrl), upgradeRequest);
+                wsSession = futureSession.orTimeout(CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS).get();
                 wsSession.setIdleTimeout(Duration.ofSeconds(300));
+                ws = localWs;
                 isConnected = true;
+                reconnecting = false;
                 logger.info("Successfully connected to " + websocketUrl);
                 break;
             }
             catch (Exception e)
             {
+                if (localWs != null)
+                {
+                    stopWsClient(localWs);
+                    localWs = null;
+                }
+                Statistics.incrementTotalTranscriberConnectionErrors();
                 int remaining = maxRetryAttempts - attempt;
                 waitTime *= multiplier;
                 logger.error("Failed connecting to " + websocketUrl + ". Retrying in "
-                        + waitTime/1000 + "seconds for another " + remaining + " times.");
-                logger.error(e.toString());
+                        + waitTime/1000 + "seconds for another " + remaining + " times.", e);
             }
             attempt++;
-            try
+            synchronized (this)
             {
-                wait(waitTime);
+                try
+                {
+                    wait(waitTime);
+                }
+                catch (InterruptedException ignored) {}
             }
-            catch (InterruptedException ignored) {}
         }
 
         if (!isConnected)
         {
+            Statistics.incrementTotalTranscriberConnectionErrors();
             logger.error("Failed connecting to " + websocketUrl + ". Nothing to do.");
         }
     }
 
-    @OnWebSocketClose
-    public void onClose(int statusCode, String reason)
+    private void stopWsClient(WebSocketClient webSocketClient)
     {
+        try
+        {
+            webSocketClient.stop();
+        }
+        catch (Exception e)
+        {
+            logger.error("Error stopping failed WebSocketClient", e);
+        }
+    }
+
+    private synchronized void reconnect()
+    {
+        if (reconnecting && !isRunning())
+        {
+            return;
+        }
+        reconnecting = true;
+
+        Statistics.incrementTotalTranscriberConnectionRetries();
+
+        threadPool.submit(() ->
+        {
+            this.stopWebSocketClient();
+
+            this.connectInternal();
+        });
+    }
+
+    @OnWebSocketClose
+    public synchronized void onClose(int statusCode, String reason)
+    {
+        logger.error("Websocket closed: " + statusCode + " reason:" + reason
+            + " isRunning: " + isRunning() + " isOpen:" + (wsSession != null && wsSession.isOpen()));
+
+        if (isRunning())
+        {
+            // let's try to reconnect
+            if (!wsSession.isOpen() || (statusCode > 1000 && statusCode < 2000))
+            {
+                reconnect();
+
+                return;
+            }
+        }
+
         wsSession = null;
         participants = null;
         participantListeners = null;
+        participantTranscriptionStarts = null;
+        participantTranscriptionIds = null;
+
+        threadPool.submit(this::stopWebSocketClient);
+    }
+
+    /**
+     * Stop the websocket client.
+     * Make sure this is executed in a different thread than the one
+     * the websocket client is running in (the onMessage, onError or onClose callbacks).
+     */
+    private void stopWebSocketClient()
+    {
+        try
+        {
+            if (ws != null)
+            {
+                ws.stop();
+                ws = null;
+            }
+        }
+        catch (Exception e)
+        {
+            logger.error("Error while stopping WebSocketClient", e);
+        }
     }
 
 
     @OnWebSocketMessage
     public void onMessage(String msg)
     {
+        try
+        {
+            this.onMessageInternal(msg);
+        }
+        catch (ParseException e)
+        {
+            logger.error("Error parsing message: " + msg, e);
+        }
+    }
+
+    private void onMessageInternal(String msg)
+        throws ParseException
+    {
         boolean partial = true;
         String result;
-        JSONObject obj = new JSONObject(msg);
-        String msgType = obj.getString("type");
-        String participantId = obj.getString("participant_id");
+
+        JSONObject obj = (JSONObject)jsonParser.parse(msg);
+        String msgType = (String)obj.get("type");
+        String participantId = (String)obj.get("participant_id");
         Participant participant = participants.get(participantId);
         if (msgType.equals("final"))
         {
             partial = false;
         }
 
-        result = obj.getString("text");
-        UUID id = UUID.fromString(obj.getString("id"));
-        Instant transcriptionStart = Instant.ofEpochMilli(obj.getLong("ts"));
-        float stability = obj.getFloat("variance");
+        result = (String)obj.get("text");
+        double stability = (double)obj.get("variance");
         if (logger.isDebugEnabled())
         {
-            logger.debug("Received final: " + result);
+            logger.debug("Received result: " + result);
         }
+
+        Instant startTranscription = participantTranscriptionStarts.getOrDefault(participantId, null);
+        UUID transcriptionId = participantTranscriptionIds.getOrDefault(participantId, null);
+
+        if (startTranscription == null)
+        {
+            Date now = new Date();
+            startTranscription = now.toInstant();
+            transcriptionId =  Generators.timeBasedReorderedGenerator().generate();
+            participantTranscriptionIds.put(participantId, transcriptionId);
+            participantTranscriptionStarts.put(participantId, startTranscription);
+        }
+
         Set<TranscriptionListener> partListeners = participantListeners.getOrDefault(participantId, null);
         if (!result.isEmpty() && partListeners != null)
         {
@@ -247,14 +391,19 @@ public class WhisperWebsocket
                 }
                 TranscriptionResult tsResult = new TranscriptionResult(
                         participant,
-                        id,
-                        transcriptionStart,
+                        transcriptionId,
+                        startTranscription,
                         partial,
                         getLanguage(participant),
                         stability,
                         new TranscriptionAlternative(result));
                 l.notify(tsResult);
             }
+        }
+        if (!partial)
+        {
+            participantTranscriptionStarts.remove(participantId);
+            participantTranscriptionIds.remove(participantId);
         }
     }
 
@@ -263,7 +412,11 @@ public class WhisperWebsocket
     @OnWebSocketError
     public void onError(Throwable cause)
     {
-        logger.error("Error while streaming audio data to transcription service.", cause);
+        if (!ended() && isRunning())
+        {
+            Statistics.incrementTotalTranscriberSendErrors();
+            logger.error("Error while streaming audio data to transcription service.", cause);
+        }
     }
 
     private String getLanguage(Participant participant)
@@ -295,11 +448,26 @@ public class WhisperWebsocket
         return fullPayload;
     }
 
-    public boolean disconnectParticipant(String participantId)
-        throws IOException
+    /**
+     * Disconnect a participant from the transcription service, executing that in a new thread so we do not block Smack.
+     * @param participantId the participant to disconnect.
+     * @param callback the callback to execute when the last participant is disconnected and session is closed.
+     */
+    public void disconnectParticipant(String participantId, Consumer<Boolean> callback)
+    {
+        threadPool.submit(() -> this.disconnectParticipantInternal(participantId, callback));
+    }
+
+    private void disconnectParticipantInternal(String participantId, Consumer<Boolean> callback)
     {
         synchronized (this)
         {
+            if (ended() && !isRunning())
+            {
+                callback.accept(true);
+                return;
+            }
+
             if (participants.containsKey(participantId))
             {
                 participants.remove(participantId);
@@ -310,11 +478,22 @@ public class WhisperWebsocket
             if (participants.isEmpty())
             {
                 logger.info("All participants have left, disconnecting from Whisper transcription server.");
-                wsSession.getRemote().sendBytes(EOF_MESSAGE);
+
+                try
+                {
+                    wsSession.getRemote().sendBytes(EOF_MESSAGE);
+                }
+                catch (IOException e)
+                {
+                    logger.error("Error while finalizing websocket connection for participant "
+                            + participantId, e);
+                }
+
                 wsSession.disconnect();
-                return true;
+                callback.accept(true);
             }
-            return false;
+
+            callback.accept(false);
         }
     }
 
@@ -328,21 +507,19 @@ public class WhisperWebsocket
         RemoteEndpoint remoteEndpoint = wsSession.getRemote();
         if (remoteEndpoint == null)
         {
+            Statistics.incrementTotalTranscriberSendErrors();
             logger.error("Failed sending audio for " + participantId + ". Attempting to reconnect.");
             if (!wsSession.isOpen())
             {
-                try
-                {
-                    connect();
-                    remoteEndpoint = wsSession.getRemote();
-                }
-                catch (Exception ex)
-                {
-                    logger.error(ex);
-                }
+                reconnect();
+            }
+            else
+            {
+                logger.warn("Failed sending audio for " + participantId
+                    + ". RemoteEndpoint is null but sessions is open.");
             }
         }
-        if (remoteEndpoint != null)
+        else
         {
             try
             {
@@ -350,6 +527,7 @@ public class WhisperWebsocket
             }
             catch (IOException e)
             {
+                Statistics.incrementTotalTranscriberSendErrors();
                 logger.error("Failed sending audio for " + participantId + ". " + e);
             }
         }
@@ -382,5 +560,16 @@ public class WhisperWebsocket
     public boolean ended()
     {
         return wsSession == null;
+    }
+
+    /**
+     * We consider this websocket transcription running when there are participants.
+     * While reconnecting we still have participants. After disconnectParticipantInternal where we clean
+     * all participants and close the socket we are no longer running, and we should not try to reconnect.
+     * @return true if operational.
+     */
+    private boolean isRunning()
+    {
+        return participants != null && !participants.isEmpty();
     }
 }

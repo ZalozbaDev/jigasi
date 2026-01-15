@@ -21,19 +21,23 @@ import net.java.sip.communicator.impl.protocol.jabber.*;
 import net.java.sip.communicator.service.protocol.*;
 import net.java.sip.communicator.service.protocol.event.*;
 import net.java.sip.communicator.service.protocol.media.*;
+import org.jitsi.utils.concurrent.*;
 import org.jitsi.xmpp.extensions.jitsimeet.*;
 import org.jitsi.jigasi.transcription.*;
 import org.jitsi.service.neomedia.*;
 import org.jitsi.service.neomedia.device.*;
-import org.jitsi.utils.logging.*;
+import org.jitsi.utils.logging2.*;
 import org.jitsi.utils.*;
-import org.jivesoftware.smack.packet.Presence;
+import org.jivesoftware.smack.packet.*;
 import org.json.simple.*;
+import org.json.simple.parser.*;
 import org.jxmpp.jid.*;
 import org.jxmpp.jid.impl.*;
 import org.jxmpp.stringprep.*;
 
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
 
 /**
  * A TranscriptionGatewaySession is able to join a JVB conference and
@@ -50,8 +54,12 @@ public class TranscriptionGatewaySession
     /**
      * The logger of this class
      */
-    private final static Logger logger
-            = Logger.getLogger(TranscriptionGatewaySession.class);
+    private final Logger logger;
+
+    /**
+     * The data form field added when transcription is enabled.
+     */
+    public static final String DATA_FORM_ROOM_METADATA_FIELD = "muc#roominfo_jitsimetadata";
 
     /**
      * The display name which should be displayed when Jigasi joins the
@@ -63,7 +71,7 @@ public class TranscriptionGatewaySession
      * How long the transcriber should wait until really leaving the conference
      * when no participant is requesting transcription anymore.
      */
-    public final static int PRESENCE_UPDATE_WAIT_UNTIL_LEAVE_DURATION = 2500;
+    public final static int PRESENCE_UPDATE_WAIT_UNTIL_LEAVE_DURATION = 3000;
 
     /**
      * The TranscriptionService used by this session
@@ -75,13 +83,6 @@ public class TranscriptionGatewaySession
      * sending {@link TranscriptionResult} to a {@link ChatRoom}
      */
     private TranscriptHandler handler;
-
-    /**
-     * The ChatRoom of the conference which is going to be transcribed.
-     * We will post messages to the ChatRoom to update users of progress
-     * of transcription
-     */
-    private ChatRoom chatRoom = null;
 
     /**
      * The transcriber managing transcriptions of audio
@@ -102,6 +103,35 @@ public class TranscriptionGatewaySession
         = new LinkedList<>();
 
     /**
+     * When a backend transcribing is enabled, overrides participants request for transcriptions and keep the
+     * transcriber in the room and working even though no participant is requesting it.
+     * This is used to make transcriptions available for post-processing.
+     */
+    private boolean isBackendTranscribingEnabled = false;
+
+    /**
+     * The thread pool to serve all leave operations.
+     */
+    private static final ScheduledExecutorService leaveThreadPool = Executors.newScheduledThreadPool(
+            2, new CustomizableThreadFactory("participants-leaving", true));
+
+    /**
+     * Keeps the number of currently leaving participants.
+     */
+    private int numberOfScheduledParticipantsLeaving = 0;
+
+    /**
+     * The currently used additional languages for translation.
+     * Used for visitors to announce the languages used by visitors.
+     */
+    private List<String> additionalLanguages = new ArrayList<>();
+
+    /**
+     * The number of visitors that are requesting transcriptions.
+     */
+    private long numberOfVisitorsRequestingTranscription = 0;
+
+    /**
      * Create a TranscriptionGatewaySession which can handle the transcription
      * of a JVB conference
      *
@@ -118,16 +148,19 @@ public class TranscriptionGatewaySession
                                        TranscriptHandler handler)
     {
         super(gateway, context);
+        this.logger = context.getLogger().createChildLogger(TranscriptionGatewaySession.class.getName());
         this.service = service;
         this.handler = handler;
 
-        this.transcriber = new Transcriber(this.service);
+        this.transcriber = new Transcriber(this.service, context, context.getLogger());
 
         if (this.service instanceof TranscriptionEventListener)
         {
             this.transcriber.addTranscriptionEventListener(
                 (TranscriptionEventListener)this.service);
         }
+
+        transcriber.setRoomName(this.getCallContext().getRoomJid().toString());
     }
 
     @Override
@@ -137,7 +170,6 @@ public class TranscriptionGatewaySession
         // the room name, url and start listening
         transcriber.addTranscriptionListener(this);
         transcriber.addTranslationListener(this);
-        transcriber.setRoomName(this.getCallContext().getRoomJid().toString());
         transcriber.setRoomUrl(getMeetingUrl());
 
         // We create a MediaWareCallConference whose MediaDevice
@@ -174,14 +206,13 @@ public class TranscriptionGatewaySession
         // We can now safely set the Call connecting to the muc room
         // and the ChatRoom of the muc room
         this.jvbCall = jvbConferenceCall;
-        this.chatRoom = super.jvbConference.getJvbRoom();
 
         // If the transcription service is not correctly configured, there is no
         // point in continuing this session, so end it immediately
         if (!service.isConfiguredProperly())
         {
             logger.warn("TranscriptionService is not properly configured");
-            sendMessageToRoom("Transcriber is not properly " +
+            super.jvbConference.sendMessageToRoom("Transcriber is not properly " +
                 "configured. Contact the service administrators and let them " +
                 "know! I will now leave.");
             jvbConference.stop();
@@ -221,7 +252,7 @@ public class TranscriptionGatewaySession
 
         if (welcomeMessage.length() > 0)
         {
-            sendMessageToRoom(welcomeMessage.toString());
+            super.jvbConference.sendMessageToRoom(welcomeMessage.toString());
         }
 
         try
@@ -294,38 +325,110 @@ public class TranscriptionGatewaySession
         super.notifyChatRoomMemberLeft(chatMember);
 
         String identifier = getParticipantIdentifier(chatMember);
-        this.transcriber.participantLeft(identifier);
+        if ("focus".equals(identifier) || this.jvbConference.getResourceIdentifier().toString().equals(identifier))
+        {
+            return;
+        }
+
+        synchronized (this)
+        {
+            numberOfScheduledParticipantsLeaving++;
+        }
+
+        // give some time for the transcriptions for this participant to be ready
+        leaveThreadPool.schedule(() ->
+            {
+                synchronized (this)
+                {
+                    numberOfScheduledParticipantsLeaving--;
+                }
+                this.transcriber.participantLeft(identifier);
+            },
+            PRESENCE_UPDATE_WAIT_UNTIL_LEAVE_DURATION,
+            TimeUnit.MILLISECONDS
+        );
+    }
+
+    /**
+     /* Checks if the participant has muted and flushes the audio buffer if so.
+     **/
+    private void flushParticipantTranscriptionBufferOnMute(ChatRoomMember chatMember, Presence presence)
+    {
+        final AtomicBoolean muted = new AtomicBoolean(false);
+        StandardExtensionElement sourceInfo =
+            (StandardExtensionElement) presence.getExtensionElement("SourceInfo", "jabber:client");
+        if (sourceInfo != null)
+        {
+            String mutedText = sourceInfo.getText();
+            JSONParser jsonParser = new JSONParser();
+            try
+            {
+                HashMap<String, JSONObject> jsonObject = (HashMap<String, JSONObject>) jsonParser.parse(mutedText);
+                jsonObject.forEach((key, value) ->
+                {
+                    // check only audio source info
+                    if (key.endsWith("a0"))
+                    {
+                        Object isMuted = value.get("muted");
+                        muted.set(isMuted != null && (boolean) isMuted);
+                    }
+                });
+            }
+            catch (Exception e)
+            {
+                logger.error("Error parsing presence while checking if participant is muted", e);
+            }
+
+            if (muted.get())
+            {
+                this.transcriber.flushParticipantAudioBuffer(getParticipantIdentifier(chatMember));
+            }
+        }
     }
 
     @Override
     void notifyChatRoomMemberUpdated(ChatRoomMember chatMember, Presence presence)
     {
         super.notifyChatRoomMemberUpdated(chatMember, presence);
+        this.flushParticipantTranscriptionBufferOnMute(chatMember, presence);
 
-        //This needed for the translation language change.
-        //update a language change coming in the presence
+        //This is needed for the translation language change.
+        //Updates a language change coming in the presence
         String identifier = getParticipantIdentifier(chatMember);
         this.transcriber.updateParticipant(identifier, chatMember);
 
-        if (transcriber.isTranscribing() &&
-            !transcriber.isAnyParticipantRequestingTranscription())
-        {
-            new Thread(() ->
-            {
-                try
-                {
-                    Thread.sleep(PRESENCE_UPDATE_WAIT_UNTIL_LEAVE_DURATION);
-                }
-                catch (InterruptedException e)
-                {
-                    e.printStackTrace();
-                }
+        this.maybeStopTranscription();
+    }
 
-                if (!transcriber.isAnyParticipantRequestingTranscription())
-                {
-                    jvbConference.stop();
-                }
-            }).start();
+    private boolean isTranscriptionRequested()
+    {
+        return transcriber.isAnyParticipantRequestingTranscription()
+                || isBackendTranscribingEnabled
+                || this.numberOfVisitorsRequestingTranscription > 0;
+    }
+
+    private void maybeStopTranscription()
+    {
+        if (transcriber.isTranscribing() && !isTranscriptionRequested())
+        {
+            // let's give some time for the transcriptions to finish
+            leaveThreadPool.schedule(() -> {
+                    if (transcriber.isTranscribing() && !isTranscriptionRequested())
+                    {
+                        if (this.numberOfScheduledParticipantsLeaving == 0)
+                        {
+                            jvbConference.stop();
+                        }
+                        else
+                        {
+                            // there seems to be still participants leaving, give them time before transcriber leaves
+                            maybeStopTranscription();
+                        }
+                    }
+                },
+                PRESENCE_UPDATE_WAIT_UNTIL_LEAVE_DURATION,
+                TimeUnit.MILLISECONDS
+            );
         }
     }
 
@@ -532,6 +635,13 @@ public class TranscriptionGatewaySession
      */
     private List<ChatRoomMember> getCurrentChatRoomMembers()
     {
+        if (super.jvbConference == null)
+        {
+            return null;
+        }
+
+        ChatRoom chatRoom = super.jvbConference.getJvbRoom();
+
         return chatRoom == null ? null : chatRoom.getMembers();
     }
 
@@ -563,7 +673,7 @@ public class TranscriptionGatewaySession
         }
         catch (XmppStringprepException e)
         {
-            e.printStackTrace();
+            logger.error(e);
         }
 
         return null;
@@ -605,32 +715,6 @@ public class TranscriptionGatewaySession
         return getConferenceMemberResourceID(conferenceMember);
     }
 
-
-    /**
-     * Send a message to the muc room
-     *
-     * @param messageString the message to send
-     */
-    private void sendMessageToRoom(String messageString)
-    {
-        if (chatRoom == null)
-        {
-            logger.error("Cannot send message as chatRoom is null");
-            return;
-        }
-
-        Message message = chatRoom.createMessage(messageString);
-        try
-        {
-            chatRoom.sendMessage(message);
-            logger.debug("Sending message: \"" + messageString + "\"");
-        }
-        catch (OperationFailedException e)
-        {
-            logger.warn("Failed to send message " + messageString, e);
-        }
-    }
-
     /**
      * Send a {@link TranscriptionResult} to the {@link ChatRoom}
      *
@@ -638,7 +722,7 @@ public class TranscriptionGatewaySession
      */
     private void sendTranscriptionResultToRoom(TranscriptionResult result)
     {
-        handler.publishTranscriptionResult(this.chatRoom, result);
+        handler.publishTranscriptionResult(super.jvbConference, result);
     }
 
     /**
@@ -648,7 +732,7 @@ public class TranscriptionGatewaySession
      */
     private void sendTranslationResultToRoom(TranslationResult result)
     {
-        handler.publishTranslationResult(this.chatRoom, result);
+        handler.publishTranslationResult(super.jvbConference, result);
     }
 
     @Override
@@ -665,13 +749,10 @@ public class TranscriptionGatewaySession
         {
             // in will_end we will be still transcribing but we need
             // to explicitly send off
-            TranscriptionStatusExtension.Status status
-                = event.getEvent() ==
-                    Transcript.TranscriptEventType.WILL_END ?
-                        TranscriptionStatusExtension.Status.OFF
-                        : transcriber.isTranscribing() ?
-                            TranscriptionStatusExtension.Status.ON
-                            : TranscriptionStatusExtension.Status.OFF;
+            TranscriptionStatusExtension.Status status = event.getEvent() == Transcript.TranscriptEventType.WILL_END
+                    ? TranscriptionStatusExtension.Status.OFF
+                    : transcriber.isTranscribing()
+                        ? TranscriptionStatusExtension.Status.ON : TranscriptionStatusExtension.Status.OFF;
 
             TranscriptionStatusExtension extension
                 = new TranscriptionStatusExtension();
@@ -687,5 +768,43 @@ public class TranscriptionGatewaySession
     public boolean hasCallResumeSupport()
     {
         return false;
+    }
+
+    /**
+     * Sets whether backend transcriptions are enabled or not.
+     */
+    public void setBackendTranscribingEnabled(boolean backendTranscribingEnabled)
+    {
+        this.isBackendTranscribingEnabled = backendTranscribingEnabled;
+
+        this.maybeStopTranscription();
+    }
+
+    /**
+     * @param count The count of visitors that are requesting transcriptions.
+     */
+    public void setVisitorsCountRequestingTranscription(long count)
+    {
+        this.numberOfVisitorsRequestingTranscription = count;
+
+        this.maybeStopTranscription();
+    }
+
+    /**
+     * To update all participant languages with the additional that are provided.
+     * @param additionalLanguages languages to add to those from the participants.
+     */
+    void updateTranslateLanguages(String[] additionalLanguages)
+    {
+        List<String> oldLangs = this.additionalLanguages;
+        this.additionalLanguages = Arrays.asList(additionalLanguages);
+
+        // remove unused streams
+        oldLangs.stream().filter(s -> !this.additionalLanguages.contains(s))
+            .forEach(lang -> this.transcriber.getTranslationManager().removeLanguage(lang));
+
+        // add new languages
+        this.additionalLanguages.stream().filter(s -> !oldLangs.contains(s))
+            .forEach(lang -> this.transcriber.getTranslationManager().addLanguage(lang));
     }
 }

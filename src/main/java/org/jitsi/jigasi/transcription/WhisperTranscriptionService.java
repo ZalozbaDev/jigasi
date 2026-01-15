@@ -18,11 +18,12 @@
 package org.jitsi.jigasi.transcription;
 
 import org.jitsi.impl.neomedia.device.*;
-import org.jitsi.utils.logging.*;
+import org.jitsi.jigasi.*;
+import org.jitsi.jigasi.stats.*;
+import org.jitsi.utils.logging2.*;
 
 import java.nio.*;
 import java.util.function.*;
-
 
 /**
  * Implements a TranscriptionService which uses a custom built Whisper server
@@ -31,21 +32,24 @@ import java.util.function.*;
  * @author Razvan Purdel
  */
 public class WhisperTranscriptionService
-        extends AbstractTranscriptionService
+    extends AbstractTranscriptionService
 {
-
     /**
      * The logger for this class
      */
-    private final static Logger logger
-            = Logger.getLogger(WhisperTranscriptionService.class);
+    private final static Logger classLogger = new LoggerImpl(WhisperTranscriptionService.class.getName());
+
+    /**
+     * The Key to use to put a websocket connection in the call context so we can share it for the room.
+     */
+    private final static String WHISPER_WS_CONNECTION_KEY = "whisper_ws_connection";
 
     @Override
     public AudioMixerMediaDevice getMediaDevice(ReceiveStreamBufferListener listener)
     {
         if (this.mediaDevice == null)
         {
-            this.mediaDevice = new TranscribingAudioMixerMediaDevice(new WhisperAudioSilenceMediaDevice(), listener);
+            this.mediaDevice = new TranscribingAudioMixerMediaDevice(new PCMAudioSilenceMediaDevice(), listener);
         }
 
         return this.mediaDevice;
@@ -76,7 +80,7 @@ public class WhisperTranscriptionService
     public void sendSingleRequest(final TranscriptionRequest request,
                                   final Consumer<TranscriptionResult> resultConsumer)
     {
-        logger.warn("The Whisper transcription service does not support single requests.");
+        classLogger.warn("The Whisper transcription service does not support single requests.");
     }
 
     @Override
@@ -87,7 +91,6 @@ public class WhisperTranscriptionService
         {
             WhisperWebsocketStreamingSession streamingSession = new WhisperWebsocketStreamingSession(participant);
 
-            streamingSession.transcriptionTag = participant.getTranslationLanguage();
             if (streamingSession.transcriptionTag == null)
             {
                 streamingSession.transcriptionTag = participant.getSourceLanguage();
@@ -96,6 +99,7 @@ public class WhisperTranscriptionService
         }
         catch (Exception e)
         {
+            Statistics.incrementTotalTranscriberSessionCreationErrors();
             throw new UnsupportedOperationException("Failed to create WS streaming session", e);
         }
     }
@@ -117,8 +121,9 @@ public class WhisperTranscriptionService
      * the lifecycle of websocket
      */
     public static class WhisperWebsocketStreamingSession
-            implements StreamingRecognitionSession
+        implements StreamingRecognitionSession
     {
+        private final Logger logger;
 
         private final Participant participant;
 
@@ -132,25 +137,45 @@ public class WhisperTranscriptionService
 
         private final String roomId;
 
-        private final WhisperConnectionPool connectionPool;
-
-
         WhisperWebsocketStreamingSession(Participant participant)
-                throws Exception
         {
             this.participant = participant;
+            this.logger = participant.getCallContext().getLogger()
+                .createChildLogger(WhisperWebsocketStreamingSession.class.getName());
             String[] debugName = this.participant.getDebugName().split("/");
             participantId = debugName[1];
-            roomId = debugName[0];
-            connectionPool = WhisperConnectionPool.getInstance();
-            wsClient = connectionPool.getConnection(roomId, participantId);
+            roomId = participant.getTranscriber().getRoomName();
+            wsClient = getConnection();
             wsClient.setTranscriptionTag(transcriptionTag);
+        }
+
+        /**
+         * Gets a connection if it exists, creates one if it doesn't.
+         * @return The websocket.
+         */
+        public WhisperWebsocket getConnection()
+        {
+            CallContext ctx = this.participant.getCallContext();
+            WhisperWebsocket socket = (WhisperWebsocket)ctx.getData(WHISPER_WS_CONNECTION_KEY);
+
+            if (socket == null)
+            {
+                logger.info("Creating a new websocket connection.");
+                socket = new WhisperWebsocket(ctx.getLogger());
+
+                socket.connect();
+
+                ctx.setData(WHISPER_WS_CONNECTION_KEY, socket);
+            }
+
+            return socket;
         }
 
         public void sendRequest(TranscriptionRequest request)
         {
             if (this.wsClient.ended())
             {
+                Statistics.incrementTotalTranscriberConnectionErrors();
                 logger.warn("Trying to send buffer without a connection.");
                 return;
             }
@@ -161,6 +186,7 @@ public class WhisperTranscriptionService
             }
             catch (Exception e)
             {
+                Statistics.incrementTotalTranscriberSendErrors();
                 logger.error("Error while sending websocket request for participant " + participantId, e);
             }
         }
@@ -172,8 +198,7 @@ public class WhisperTranscriptionService
 
         public void end()
         {
-            logger.info("Disconnecting " + this.participantId + " from Whisper transcription service.");
-            connectionPool.end(this.roomId, this.participantId);
+            wsClient.disconnectParticipant(this.participantId, allDisconnected -> {});
         }
 
         public boolean ended()

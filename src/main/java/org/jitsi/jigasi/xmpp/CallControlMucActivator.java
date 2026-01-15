@@ -17,6 +17,7 @@
  */
 package org.jitsi.jigasi.xmpp;
 
+import static org.jitsi.jigasi.util.Util.*;
 import static org.jivesoftware.smack.packet.StanzaError.Condition.internal_server_error;
 
 import net.java.sip.communicator.impl.protocol.jabber.*;
@@ -30,11 +31,11 @@ import org.jitsi.jigasi.util.*;
 import org.jitsi.utils.logging.Logger;
 import org.jitsi.xmpp.extensions.rayo.*;
 import org.jitsi.service.configuration.*;
-import org.jitsi.xmpp.util.*;
 import org.jivesoftware.smack.*;
 import org.jivesoftware.smack.bosh.*;
 import org.jivesoftware.smack.iqrequest.*;
 import org.jivesoftware.smack.packet.*;
+import org.jivesoftware.smackx.disco.*;
 import org.jxmpp.jid.parts.*;
 import org.osgi.framework.*;
 
@@ -78,7 +79,7 @@ public class CallControlMucActivator
     private CallControl callControl = null;
 
     private ConfigurationService configService;
-    
+
     /**
      * The thread pool to serve all call control operations.
      */
@@ -88,7 +89,7 @@ public class CallControlMucActivator
     {
         super(ConfigurationService.class);
     }
-    
+
     /**
      * Starts muc control component. Finds all xmpp accounts and listen for
      * new ones registered.
@@ -302,6 +303,9 @@ public class CallControlMucActivator
                 conn.registerIQRequestHandler(new HangUpIqHandler(pps));
 
                 connectionResource = conn.getUser().getResourceOrNull();
+
+                // to make sure EntityCapsManager.currentCapsVersion is properly initialized
+                ServiceDiscoveryManager.getInstanceFor(conn).addFeature(JIGASI_FEATURE_NAME);
             }
 
             OperationSetMultiUserChat muc = pps.getOperationSet(OperationSetMultiUserChat.class);
@@ -375,6 +379,10 @@ public class CallControlMucActivator
     {
         updatePresenceStatusForXmppProviders();
     }
+
+    @Override
+    public void notifyConferenceLive(boolean v)
+    {}
 
     @Override
     public void onLobbyWaitReview(ChatRoom lobbyRoom)
@@ -597,14 +605,14 @@ public class CallControlMucActivator
                             {
                                 logger.error(
                                         ctx + " Cannot send reply for dialIQ:"
-                                                + XmlStringBuilderUtil.toStringOpt(packet));
+                                                + packet.toXML());
                             }
                         }
                     });
             }
             catch (RejectedExecutionException e)
             {
-                logger.error(ctx + " Failed to handle incoming dialIQ:" + XmlStringBuilderUtil.toStringOpt(packet));
+                logger.error(ctx + " Failed to handle incoming dialIQ:" + packet.toXML());
 
                 return IQ.createErrorResponse(packet, StanzaError.getBuilder()
                     .setCondition(internal_server_error)
@@ -619,7 +627,7 @@ public class CallControlMucActivator
         {
             if (logger.isDebugEnabled())
             {
-                logger.debug(ctx + " Processing a RayoIq: " + XmlStringBuilderUtil.toStringOpt(packet));
+                logger.debug(ctx + " Processing a RayoIq: " + packet.toXML());
             }
 
             try
@@ -686,11 +694,19 @@ public class CallControlMucActivator
                 room = waiter.lobbyRoom;
             }
 
-            response.setUri("xmpp:" + room.getIdentifier() + "/" + room.getUserNickname());
+            // room can be null when the meeting is not live yet
+            if (room != null)
+            {
+                response.setUri("xmpp:" + room.getIdentifier() + "/" + room.getUserNickname());
 
-            final XMPPConnection roomConnection = ((ProtocolProviderServiceJabberImpl) room.getParentProvider())
-                .getConnection();
-            roomConnection.registerIQRequestHandler(new HangUpIqHandler(room.getParentProvider()));
+                final XMPPConnection roomConnection = ((ProtocolProviderServiceJabberImpl) room.getParentProvider())
+                        .getConnection();
+                roomConnection.registerIQRequestHandler(new HangUpIqHandler(room.getParentProvider()));
+            }
+            else
+            {
+                logger.warn("Room is null for session: " + session);
+            }
         }
     }
 
@@ -714,6 +730,15 @@ public class CallControlMucActivator
         public void onJvbRoomJoined(AbstractGatewaySession source)
         {
             countDownLatch.countDown();
+        }
+
+        @Override
+        public void notifyConferenceLive(boolean live)
+        {
+            if (!live)
+            {
+                countDownLatch.countDown();
+            }
         }
 
         @Override

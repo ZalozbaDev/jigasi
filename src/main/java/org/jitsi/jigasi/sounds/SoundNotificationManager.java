@@ -28,25 +28,27 @@ import org.jitsi.jigasi.util.*;
 import org.jitsi.service.neomedia.*;
 import org.jitsi.service.neomedia.codec.*;
 import org.jitsi.utils.*;
-import org.jitsi.utils.logging.Logger;
+import org.jitsi.utils.logging2.*;
 import org.jitsi.xmpp.extensions.jibri.*;
+import org.jitsi.xmpp.extensions.jitsimeet.*;
 import org.jivesoftware.smack.packet.*;
 
 import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Manages all sounds notifications that are send to a SIP session side.
+ * Manages all sounds notifications that are sent to a SIP session side.
  *
  * @author Damian Minkov
  */
 public class SoundNotificationManager
 {
+    private final static Logger classLogger = new LoggerImpl(SoundNotificationManager.class.getName());
+
     /**
      * The logger.
      */
-    private final static Logger logger = Logger.getLogger(
-        SoundNotificationManager.class);
+    private final Logger logger;;
 
     /**
      * The sound file to use when recording is ON.
@@ -83,14 +85,12 @@ public class SoundNotificationManager
     public static final String PARTICIPANT_ALONE = "sounds/Alone.opus";
 
     /**
-     * The sound file to use to notify sip participant that a
-     * participant has left.
+     * The sound file to use to notify the sip participant that a participant has left.
      */
     public static final String PARTICIPANT_LEFT = "sounds/ParticipantLeft.opus";
 
     /**
-     * The sound file to use to notify sip partitipant that a
-     * new participant has joined.
+     * The sound file to use to notify the sip participant that a new participant has joined.
      */
     public static final String PARTICIPANT_JOINED = "sounds/ParticipantJoined.opus";
 
@@ -112,14 +112,14 @@ public class SoundNotificationManager
     private static final String LOBBY_MEETING_END = "sounds/LobbyMeetingEnd.opus";
 
     /**
-     * The sound file to use to notify the participant that request to join is being reviewed.
+     * The sound file to use to notify the participant that the request to join is being reviewed.
      */
     private static final String LOBBY_JOIN_REVIEW = "sounds/LobbyWait.opus";
 
     /**
      * Approximate duration of the file to be played, we need it as to know
-     * when to hangup the call. The actual file is 10 seconds but we give a
-     * little longer for the file to be played and call to be answered.
+     * when to hangup the call. The actual file is 10 seconds, but we give a
+     * little longer for the file to be played and the call to be answered.
      */
     private static final int MAX_OCCUPANTS_SOUND_DURATION_SEC = 15;
 
@@ -139,7 +139,7 @@ public class SoundNotificationManager
     private final SipGatewaySession gatewaySession;
 
     /**
-     * When set will indicate that we only need to play announcement to the
+     * When set will indicate that we only need to play an announcement to the
      * sip side and hangup the call.
      */
     private boolean callMaxOccupantsLimitReached = false;
@@ -185,14 +185,14 @@ public class SoundNotificationManager
     private static final long PARTICIPANT_JOINED_RATE_TIMEOUT_MS = 30000;
 
     /**
-     * Timer trigger notification when participant is the only one
+     * Timer trigger notification when a participant is the only one
      * in the conference for a certain amount of time.
      */
     private Timer participantAloneNotificationTimerLazy = null;
 
     /**
-     * Task to trigger notification when participant is the only one
-     * in the conference from a certain amount of time.
+     * Task to trigger notification when the participant is the only one
+     * in the conference for a certain amount of time.
      */
     private TimerTask participantAloneNotificationTask = null;
 
@@ -202,7 +202,7 @@ public class SoundNotificationManager
     private final Object participantAloneNotificationSync = new Object();
 
     /**
-     * A queue of files to be played when call is connected.
+     * A queue of files to be played when the call is connected.
      */
     private PlaybackQueue playbackQueue = new PlaybackQueue();
 
@@ -214,16 +214,8 @@ public class SoundNotificationManager
     public SoundNotificationManager(SipGatewaySession gatewaySession)
     {
         this.gatewaySession = gatewaySession;
-    }
-
-    /**
-     * Returns the call context for the current session.
-
-     * @return the call context for the current session.
-     */
-    private CallContext getCallContext()
-    {
-        return this.gatewaySession.getCallContext();
+        this.logger = this.gatewaySession.getCallContext().getLogger()
+            .createChildLogger(SoundNotificationManager.class.getName());
     }
 
     /**
@@ -232,18 +224,42 @@ public class SoundNotificationManager
      */
     public void process(Presence presence)
     {
-        RecordingStatus rs = presence.getExtension(RecordingStatus.class);
-
-        if (rs != null
-            && gatewaySession.getFocusResourceAddr().equals(
-                presence.getFrom().getResourceOrEmpty().toString()))
+        if (gatewaySession.getFocusResourceAddr().equals(presence.getFrom().getResourceOrEmpty().toString()))
         {
-            notifyRecordingStatusChanged(rs.getRecordingMode(), rs.getStatus());
+            boolean isJibriRecordingOn = false;
+            RecordingStatus rs = presence.getExtension(RecordingStatus.class);
+            if (rs != null)
+            {
+                isJibriRecordingOn = rs.getStatus() == JibriIq.Status.ON;
+            }
+
+            boolean isAudioRecordingOn = false;
+            ConferenceProperties props = presence.getExtension(ConferenceProperties.class);
+
+            if (props != null)
+            {
+                ConferenceProperties.ConferenceProperty prop
+                    = props.getProperties().stream()
+                        .filter(p -> ConferenceProperties.KEY_AUDIO_RECORDING_ENABLED.equals(p.getKey()))
+                        .findFirst().orElse(null);
+
+                isAudioRecordingOn = prop != null && Boolean.parseBoolean(prop.getValue());
+            }
+
+            JibriIq.Status newStatus
+                = isJibriRecordingOn || isAudioRecordingOn ? JibriIq.Status.ON : JibriIq.Status.OFF;
+
+            if (currentJibriStatus.equals(newStatus))
+            {
+                return;
+            }
+
+            notifyRecordingStatusChanged(rs != null ? rs.getRecordingMode() : JibriIq.RecordingMode.FILE, newStatus);
         }
     }
 
     /**
-     * Method called notify that a recording status change was detected.
+     * Method called to notify that a recording status change was detected.
      *
      * @param mode The recording mode.
      * @param status The recording status.
@@ -251,11 +267,6 @@ public class SoundNotificationManager
     private void notifyRecordingStatusChanged(
         JibriIq.RecordingMode mode, JibriIq.Status status)
     {
-        // not a change, ignore
-        if (currentJibriStatus.equals(status))
-        {
-            return;
-        }
         currentJibriStatus = status;
 
         String offSound;
@@ -287,17 +298,17 @@ public class SoundNotificationManager
         }
         catch(InterruptedException ex)
         {
-            logger.error(getCallContext() + " Error playing sound notification");
+            logger.error("Error playing sound notification");
         }
     }
 
     /**
-     * Injects sound file in a call's <tt>MediaStream</tt> using injectPacket
+     * Injects a sound file in a call's <tt>MediaStream</tt> using injectPacket
      * method and constructing RTP packets for it.
-     * Supports opus only (when using translator mode calls from the jitsi-meet
+     * Supports opus only (when using translator mode, calls from the jitsi-meet
      * side are using opus and are just translated to the sip side).
      *
-     * The file will be played if possible, if there is call passed and that
+     * The file will be played if possible is there is a call passed and that
      * call has call peers of type MediaAwareCallPeer with media handler that
      * has MediaStream for Audio.
      *
@@ -308,7 +319,7 @@ public class SoundNotificationManager
     {
         MediaStream stream = getMediaStream(call);
 
-        // if there is no stream or the calling account is not using translator
+        // if there is no stream, or the calling account is not using translator,
         // or the current call is not using opus
         if (stream == null
             || !call.getProtocolProvider().getAccountID().getAccountPropertyBoolean(
@@ -327,7 +338,7 @@ public class SoundNotificationManager
         }
         catch (Throwable t)
         {
-            logger.error(call.getData(CallContext.class) + " Error playing:" + fileName, t);
+            classLogger.error(call.getData(CallContext.class) + " Error playing:" + fileName, t);
         }
     }
 
@@ -336,7 +347,7 @@ public class SoundNotificationManager
      * the stream.
      * @param stream the stream where we inject the sound as rtp.
      * @param fileName the file name to play.
-     * @throws Throwable cannot read source sound file or cannot transmit it.
+     * @throws Throwable cannot read a source sound file or cannot transmit it.
      */
     static void injectSoundFileInStream(MediaStream stream, String fileName)
         throws Throwable
@@ -402,9 +413,9 @@ public class SoundNotificationManager
     }
 
     /**
-     * Process call peer state change, if we are going to play a notification
+     * Process call peer state change, if we are going to play a notification,
      * we want to return the time in seconds to wait before hanging up the sip
-     * side, this is in order to be able to signal a message to the caller.
+     * side, this is to be able to signal a message to the caller.
      *
      * @param callPeerState The call peer state to process.
      */
@@ -444,7 +455,7 @@ public class SoundNotificationManager
             }
             catch(InterruptedException ex)
             {
-                logger.error(getCallContext() + " Error playing sound notification");
+                logger.error("Error playing sound notification");
             }
         }
         else if (CallPeerState.DISCONNECTED.equals(callPeerState))
@@ -499,7 +510,7 @@ public class SoundNotificationManager
         }
         catch(OperationFailedException e)
         {
-            logger.error(getCallContext() + " Cannot answer call to play max occupants sound", e);
+            logger.error("Cannot answer call to play max occupants sound", e);
             return;
         }
 
@@ -510,7 +521,7 @@ public class SoundNotificationManager
         }
         catch(InterruptedException e)
         {
-            logger.warn(getCallContext() + " Didn't finish waiting for hangup on max occupants");
+            logger.warn("Didn't finish waiting for hangup on max occupants");
         }
     }
 
@@ -536,7 +547,7 @@ public class SoundNotificationManager
                     }
                     catch(Exception ex)
                     {
-                        logger.error(getCallContext() + ex.getMessage(), ex);
+                        logger.error(ex.getMessage(), ex);
                     }
                 }
             };
@@ -689,7 +700,7 @@ public class SoundNotificationManager
         }
         catch (Exception ex)
         {
-            logger.error(getCallContext() + " " + ex.toString(), ex);
+            logger.error(ex.toString(), ex);
         }
     }
 
@@ -747,7 +758,7 @@ public class SoundNotificationManager
         }
         catch(Exception ex)
         {
-            logger.error(getCallContext() + " " + ex.getMessage(), ex);
+            logger.error(ex.getMessage(), ex);
         }
     }
 
@@ -771,7 +782,7 @@ public class SoundNotificationManager
         }
         catch(Exception ex)
         {
-            logger.error(getCallContext() + " " + ex.getMessage(), ex);
+            logger.error(ex.getMessage(), ex);
         }
     }
 
@@ -797,12 +808,12 @@ public class SoundNotificationManager
         }
         catch(Exception ex)
         {
-            logger.error(getCallContext() + " " + ex.getMessage());
+            logger.error(ex.getMessage());
         }
     }
 
     /**
-     * Returns new Timer that will trigger playback for
+     * Returns a new Timer that will trigger playback for
      * PARTICIPANT_ALONE notification.
      *
      * @return participantAloneNotificationTimerLazy
@@ -819,7 +830,7 @@ public class SoundNotificationManager
     }
 
     /**
-     * Returns new SoundRateLimiter to be used for participant left
+     * Returns a new SoundRateLimiter to be used for participant left
      * if not created already.
      *
      * @return participantLeftRateLimiterLazy
@@ -836,7 +847,7 @@ public class SoundNotificationManager
     }
 
     /**
-     * Returns new SoundRateLimiter to be used for participant joined
+     * Returns a new SoundRateLimiter to be used for participant joined
      * if not created already.
      *
      * @return participantJoinedRateLimiterLazy

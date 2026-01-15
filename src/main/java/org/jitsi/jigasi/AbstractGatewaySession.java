@@ -308,6 +308,23 @@ public abstract class AbstractGatewaySession
     }
 
     /**
+     * Method called to notify that the conference is live or not live yet.
+     */
+    public void notifyConferenceLive(boolean v)
+    {
+        Iterable<GatewaySessionListener> gwListeners;
+        synchronized (listeners)
+        {
+            gwListeners = new ArrayList<>(listeners);
+        }
+
+        for (GatewaySessionListener listener : gwListeners)
+        {
+            listener.notifyConferenceLive(v);
+        }
+    }
+
+    /**
      *  Method called by {@link JvbConference} that it has reached
      *  the maximum number of occupants and gives a chance to the session to
      *  handle it.

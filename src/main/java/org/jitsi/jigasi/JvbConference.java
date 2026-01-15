@@ -22,16 +22,20 @@ import net.java.sip.communicator.service.protocol.*;
 import net.java.sip.communicator.service.protocol.event.*;
 import net.java.sip.communicator.service.protocol.jabber.*;
 import net.java.sip.communicator.service.protocol.media.*;
-import net.java.sip.communicator.util.DataObject;
-import net.java.sip.communicator.util.osgi.ServiceUtils;
+import net.java.sip.communicator.util.*;
+import net.java.sip.communicator.util.osgi.*;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.http.client.utils.*;
 import org.jitsi.impl.neomedia.*;
-import org.jitsi.jigasi.lobby.Lobby;
+import org.jitsi.jigasi.lobby.*;
+import org.jitsi.jigasi.sip.*;
 import org.jitsi.jigasi.stats.*;
 import org.jitsi.jigasi.util.*;
 import org.jitsi.jigasi.version.*;
+import org.jitsi.jigasi.visitor.*;
+import org.jitsi.jigasi.xmpp.extensions.*;
 import org.jitsi.utils.*;
-import org.jitsi.utils.logging.Logger;
+import org.jitsi.utils.logging2.*;
 import org.jitsi.utils.queue.*;
 import org.jitsi.xmpp.extensions.*;
 import org.jitsi.xmpp.extensions.colibri.*;
@@ -39,17 +43,21 @@ import org.jitsi.xmpp.extensions.jitsimeet.*;
 import org.jitsi.service.configuration.*;
 import org.jitsi.service.neomedia.*;
 import org.jitsi.xmpp.extensions.rayo.*;
+import org.jitsi.xmpp.extensions.visitors.*;
 import org.jivesoftware.smack.*;
 import org.jivesoftware.smack.bosh.*;
 import org.jivesoftware.smack.filter.*;
+import org.jivesoftware.smack.iqrequest.*;
 import org.jivesoftware.smack.packet.*;
 import org.jivesoftware.smackx.disco.*;
 import org.jivesoftware.smackx.disco.packet.*;
+import org.jivesoftware.smackx.muc.filter.*;
 import org.jivesoftware.smackx.muc.packet.*;
 import org.jivesoftware.smackx.nick.packet.*;
 import org.jivesoftware.smackx.xdata.packet.*;
 import org.jivesoftware.smackx.xdata.*;
 import org.json.simple.*;
+import org.json.simple.parser.*;
 import org.jxmpp.jid.*;
 import org.jxmpp.jid.impl.*;
 import org.jxmpp.jid.parts.*;
@@ -58,11 +66,17 @@ import org.osgi.framework.*;
 
 import java.beans.*;
 import java.io.*;
+import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
 
 import static net.java.sip.communicator.service.protocol.event.LocalUserChatRoomPresenceChangeEvent.*;
 import static org.jivesoftware.smack.packet.StanzaError.Condition.*;
+
+import static org.jitsi.jigasi.lobby.Lobby.*;
+import static org.jitsi.jigasi.TranscriptionGatewaySession.*;
+import static org.jitsi.jigasi.util.Util.*;
+
 
 /**
  * Class takes care of handling Jitsi Videobridge conference. Currently, it waits
@@ -86,14 +100,7 @@ public class JvbConference
     /**
      * The logger.
      */
-    private final static Logger logger = Logger.getLogger(JvbConference.class);
-
-    /**
-     * The name of XMPP feature which states for Jigasi SIP Gateway and can be
-     * used to recognize gateway client.
-     */
-    public static final String SIP_GATEWAY_FEATURE_NAME
-        = "http://jitsi.org/protocol/jigasi";
+    private final Logger logger;
 
     /**
      * The name of XMPP feature for Jingle/DTMF feature (XEP-0181).
@@ -129,6 +136,11 @@ public class JvbConference
         = "org.jitsi.jigasi.LOCAL_REGION";
 
     /**
+     * The name of the property which configured the stats Id.
+     */
+    public static final String STATS_ID_PNAME = "org.jitsi.jigasi.STATS_ID";
+
+    /**
      * The name of the (unique) meeting id field in the MUC data form.
      */
     private static final String DATA_FORM_MEETING_ID_FIELD_NAME = "muc#roominfo_meetingId";
@@ -137,6 +149,32 @@ public class JvbConference
      * The milliseconds to wait before check the jvb side of the call for activity.
      */
     private static final int JVB_ACTIVITY_CHECK_DELAY = 5000;
+
+    /**
+     * The name of the property which enables visitors queue service.
+     */
+    public static final String P_NAME_VISITORS_QUEUE_SERVICE = "org.jitsi.jigasi.VISITOR_QUEUE_SERVICE";
+
+    /**
+     * The visitors queue service url.
+     */
+    private static String visitorsQueueServiceUrl = null;
+    static
+    {
+        visitorsQueueServiceUrl = JigasiBundleActivator.getConfigurationService()
+            .getString(P_NAME_VISITORS_QUEUE_SERVICE);
+    }
+
+    /**
+     * The error code used to indicate that the meeting is not live.
+     * (number that is not clashing with OperationFailedException error codes)
+     */
+    private static final int NOT_LIVE_ERROR_CODE = 101;
+
+    /**
+     * The websocket client to connect to visitors queue if configured.
+     */
+    private WebsocketClient websocketClient;
 
     /**
      * A timer which will be used to schedule a quick non-blocking check whether there is any activity
@@ -154,31 +192,18 @@ public class JvbConference
      */
     private String meetingId;
 
+    private static ExecutorService threadPool = Util.createNewThreadPool("xmpp-executor-pool");
+
     /**
      * A queue used to offload xmpp execution in a new thread to avoid blocking xmpp threads,
      * by executing the tasks in new thread
      */
-    public static final PacketQueue<Runnable> xmppInvokeQueue = new PacketQueue<>(
-        Integer.MAX_VALUE,
-        false,
-        "xmpp-invoke-queue",
-        r -> {
-            // do process and try
-            try
-            {
-                r.run();
+    public final PacketQueue<Runnable> xmppInvokeQueue;
 
-                return true;
-            }
-            catch (Exception e)
-            {
-                logger.error("Error processing xmpp queue item", e);
-
-                return false;
-            }
-        },
-        Util.createNewThreadPool("xmpp-executor-pool")
-    );
+    /**
+     * A queue used for sending xmpp messages.
+     */
+    public final PacketQueue<Runnable> xmppSendQueue;
 
     /**
      * Used for randomizing usernames if needed.
@@ -190,29 +215,37 @@ public class JvbConference
      * <tt>OperationSetJitsiMeetTools</tt> instance.
      * @return Returns the 'features' extension element that can be added to presence.
      */
-    private static ExtensionElement addSupportedFeatures(
+    private ExtensionElement addSupportedFeatures(
             OperationSetJitsiMeetToolsJabber meetTools)
     {
         FeaturesExtension features = new FeaturesExtension();
 
-        meetTools.addSupportedFeature(SIP_GATEWAY_FEATURE_NAME);
-        features.addChildExtension(Util.createFeature(SIP_GATEWAY_FEATURE_NAME));
-        meetTools.addSupportedFeature(DTMF_FEATURE_NAME);
-        features.addChildExtension(Util.createFeature(DTMF_FEATURE_NAME));
+        meetTools.addSupportedFeature(JIGASI_FEATURE_NAME);
+        features.addChildExtension(Util.createFeature(JIGASI_FEATURE_NAME));
 
-        ConfigurationService cfg
-                = JigasiBundleActivator.getConfigurationService();
+        if (this.isTranscriber)
+        {
+            meetTools.addSupportedFeature(TRANSCRIBER_FEATURE_NAME);
+            features.addChildExtension(Util.createFeature(TRANSCRIBER_FEATURE_NAME));
+        }
+        else
+        {
+            // dtmf is used only when sip calling
+            meetTools.addSupportedFeature(DTMF_FEATURE_NAME);
+            features.addChildExtension(Util.createFeature(DTMF_FEATURE_NAME));
+        }
+
+        ConfigurationService cfg = JigasiBundleActivator.getConfigurationService();
 
         // Remove ICE support from features list ?
         if (cfg.getBoolean(SipGateway.P_NAME_DISABLE_ICE, false))
         {
-            meetTools.removeSupportedFeature(
-                    "urn:xmpp:jingle:transports:ice-udp:1");
+            meetTools.removeSupportedFeature("urn:xmpp:jingle:transports:ice-udp:1");
 
             logger.info("ICE feature will not be advertised");
         }
 
-        ExtensionElement audioMuteFeature = AudioModeration.addSupportedFeatures(meetTools);
+        ExtensionElement audioMuteFeature = AudioModeration.getSupportedFeatures(meetTools);
         if (audioMuteFeature != null)
         {
             features.addChildExtension(audioMuteFeature);
@@ -226,6 +259,11 @@ public class JvbConference
      * instance.
      */
     private final AbstractGatewaySession gatewaySession;
+
+    /**
+     * Whether Jigasi will join as transcriber.
+     */
+    private final boolean isTranscriber;
 
     /**
      * Whether to auto stop when only jigasi are left in the room.
@@ -313,6 +351,11 @@ public class JvbConference
         "Did not received session invite"
     );
 
+    private final JvbConferenceStopTimeout emptyTimeout = new JvbConferenceStopTimeout(
+            "EmptyCallTimeout",
+            "only bots or empty room",
+            "only bots or empty room"
+    );
     /**
      * The last status we sent in the conference using setPresenceStatus.
      */
@@ -363,17 +406,51 @@ public class JvbConference
     /**
      * Listens for room configuration changes and request room config to reflect it locally.
      */
-    private RoomConfigurationChangeListener roomConfigurationListener = null;
+    private final RoomConfigurationChangeListener roomConfigurationListener = new RoomConfigurationChangeListener();
 
     /**
-     * Up-to-date list of participants in the room that are jigasi.
+     * Listens for messages from room metadata component for changes in room metadata.
      */
-    private final List<String> jigasiChatRoomMembers = Collections.synchronizedList(new ArrayList<>());
+    private final RoomMetadataListener roomMetadataListener = new RoomMetadataListener();
+
+    /**
+     * Listens for messages from visitors component.
+     */
+    private final VisitorsMessagesListener visitorsMessagesListener = new VisitorsMessagesListener();
+
+    /**
+     * The Presence listener we use to monitor the initial participants when joining. We need this only when in
+     * transcriber mode. To make sure there is a single transcriber in the room.
+     */
+    private final ChatRoomPresenceListener presenceListener = new ChatRoomPresenceListener();
 
     /**
      * The features for the current xmpp provider we will use later adding to the room presence we send.
+     * We need to initialize this before connecting to make sure features are added correctly.
      */
     private ExtensionElement features = null;
+
+    /**
+     * Whether we are currently joining as a visitor.
+     */
+    private boolean isVisitor = false;
+
+    /**
+     * Listens for visitor IQs, waiting for promotion responses.
+     */
+    private VisitorIqHandler visitorIqHandler = null;
+
+    /**
+     * Whether to skip inviting focus on the next attempt to join a room.
+     */
+    private boolean skipFocus = false;
+
+    /**
+     * We store bosh connection and room before joining as a visitor, to be able
+     * to restore them when promoting back to main room.
+     */
+    private String oldRoom = null;
+    private String oldBosh = null;
 
     /**
      * Creates new instance of <tt>JvbConference</tt>
@@ -383,19 +460,63 @@ public class JvbConference
      */
     public JvbConference(AbstractGatewaySession gatewaySession, CallContext ctx)
     {
+        this.logger = ctx.getLogger().createChildLogger(JvbConference.class.getName());
         this.gatewaySession = gatewaySession;
+        this.isTranscriber = this.gatewaySession instanceof TranscriptionGatewaySession;
         this.callContext = ctx;
         this.allowOnlyJigasiInRoom = JigasiBundleActivator.getConfigurationService()
             .getBoolean(P_NAME_ALLOW_ONLY_JIGASIS_IN_ROOM, true);
 
-        if (this.gatewaySession instanceof SipGatewaySession)
-        {
-            this.audioModeration = new AudioModeration(this, (SipGatewaySession)this.gatewaySession, this.callContext);
-        }
-        else
+        if (this.isTranscriber)
         {
             this.audioModeration = null;
         }
+        else
+        {
+            this.audioModeration = new AudioModeration(this, (SipGatewaySession)this.gatewaySession, this.callContext);
+        }
+        this.xmppSendQueue = new PacketQueue<>(
+            Integer.MAX_VALUE,
+            false,
+            "xmpp-send-queue",
+            r -> {
+                // do process and try
+                try
+                {
+                    r.run();
+
+                    return true;
+                }
+                catch (Throwable e)
+                {
+                    logger.error("Error processing xmpp queue item", e);
+
+                    return false;
+                }
+            },
+            threadPool
+        );
+        xmppInvokeQueue = new PacketQueue<>(
+                Integer.MAX_VALUE,
+                false,
+                "xmpp-invoke-queue",
+                r -> {
+                    // do process and try
+                    try
+                    {
+                        r.run();
+
+                        return true;
+                    }
+                    catch (Throwable e)
+                    {
+                        logger.error("Error processing xmpp queue item", e);
+
+                        return false;
+                    }
+                },
+                threadPool
+        );
     }
 
     public AudioModeration getAudioModeration()
@@ -441,20 +562,17 @@ public class JvbConference
                 {
                     resourceIdentifier
                         = Localpart.from(
-                            resourceIdentBuilder.replace("[^A-Za-z0-9]", "-"));
+                            resourceIdentBuilder.replaceAll("[^A-Za-z0-9]", "-"));
                 }
                 catch (XmppStringprepException e)
                 {
-                    logger.error(this.callContext
-                        + " The SIP URI is invalid to use an XMPP"
-                        + " resource, identifier will be a random string", e);
+                    logger.error(
+                        "The SIP URI is invalid to use an XMPP resource, identifier will be a random string", e);
                 }
             }
             else
             {
-                logger.info(this.callContext
-                    + " The SIP URI is empty! The XMPP resource "
-                    + "identifier will be a random string.");
+                logger.info("The SIP URI is empty! The XMPP resource identifier will be a random string.");
             }
         }
 
@@ -486,41 +604,41 @@ public class JvbConference
             logger.error(this.callContext + " Already started !");
             return;
         }
-        logger.info(this.callContext + " Starting JVB conference room: " + this.callContext.getRoomJid());
+        logger.info("Starting JVB conference room: " + this.callContext.getRoomJid());
 
         Localpart resourceIdentifier = getResourceIdentifier();
 
-        this.xmppProviderFactory
-            = ProtocolProviderFactory.getProtocolProviderFactory(
-                JigasiBundleActivator.osgiContext,
-                ProtocolNames.JABBER);
+        this.createAndLoadAccount(createAccountPropertiesForCallId(resourceIdentifier.toString()));
 
-        this.xmppAccount
-            = xmppProviderFactory.createAccount(
-                    createAccountPropertiesForCallId(
-                            callContext,
-                            resourceIdentifier.toString()));
+        if (this.xmppProvider == null)
+        {
+            // Listen for XMPP provider to be added
+            JigasiBundleActivator.osgiContext.addServiceListener(this);
+        }
+    }
+
+    private void createAndLoadAccount(Map<String, String> accountProperties)
+    {
+        this.xmppProviderFactory = ProtocolProviderFactory.getProtocolProviderFactory(
+            JigasiBundleActivator.osgiContext, ProtocolNames.JABBER);
+
+        this.xmppAccount = xmppProviderFactory.createAccount(accountProperties);
 
         xmppProviderFactory.loadAccount(xmppAccount);
 
         started = true;
 
         // Look for first XMPP provider
-        Collection<ServiceReference<ProtocolProviderService>> providers
-            = ServiceUtils.getServiceReferences(
-                    JigasiBundleActivator.osgiContext,
-                    ProtocolProviderService.class);
+        Collection<ServiceReference<ProtocolProviderService>> providers = ServiceUtils.getServiceReferences(
+            JigasiBundleActivator.osgiContext, ProtocolProviderService.class);
 
         for (ServiceReference<ProtocolProviderService> serviceRef : providers)
         {
-            ProtocolProviderService candidate
-                = JigasiBundleActivator.osgiContext.getService(serviceRef);
+            ProtocolProviderService candidate = JigasiBundleActivator.osgiContext.getService(serviceRef);
 
             if (ProtocolNames.JABBER.equals(candidate.getProtocolName()))
             {
-                if (candidate.getAccountID()
-                    .getAccountUniqueID()
-                    .equals(xmppAccount.getAccountUniqueID()))
+                if (candidate.getAccountID().getAccountUniqueID().equals(xmppAccount.getAccountUniqueID()))
                 {
                     setXmppProvider(candidate);
 
@@ -531,12 +649,6 @@ public class JvbConference
                 }
             }
         }
-
-        if (this.xmppProvider == null)
-        {
-            // Listen for XMPP provider to be added
-            JigasiBundleActivator.osgiContext.addServiceListener(this);
-        }
     }
 
     /**
@@ -546,7 +658,7 @@ public class JvbConference
     {
         if (!started)
         {
-            logger.error(this.callContext + " Already stopped !");
+            logger.error("Already stopped !");
             return;
         }
 
@@ -566,9 +678,24 @@ public class JvbConference
             this.audioModeration.cleanXmppProvider();
         }
 
+        if (this.visitorIqHandler != null)
+        {
+            XMPPConnection connection = this.getConnection();
+            if (connection != null)
+            {
+                connection.unregisterIQRequestHandler(this.visitorIqHandler);
+                this.visitorIqHandler = null;
+            }
+        }
+
         gatewaySession.onJvbConferenceWillStop(this, endReasonCode, endReason);
 
         leaveConferenceRoom();
+
+        if (this.websocketClient != null)
+        {
+            this.websocketClient.disconnect();
+        }
 
         if (jvbCall != null)
         {
@@ -582,8 +709,7 @@ public class JvbConference
             // in case we were not able to create jvb call, unit tests case
             if (jvbCall == null)
             {
-                logger.info(
-                    callContext + " Removing account " + xmppAccount);
+                logger.info("Removing account " + xmppAccount);
 
                 xmppProviderFactory.unloadAccount(xmppAccount);
             }
@@ -617,12 +743,11 @@ public class JvbConference
                 .equals(xmppAccount.getAccountUniqueID()))
         {
 
-            logger.info(
-                this.callContext + " Rejects XMPP provider " + xmppProvider);
+            logger.info("Rejects XMPP provider " + xmppProvider);
             return;
         }
 
-        logger.info(this.callContext + " Using " + xmppProvider);
+        logger.info("Using " + xmppProvider);
 
         this.xmppProvider = xmppProvider;
 
@@ -659,14 +784,9 @@ public class JvbConference
 
     private synchronized void registrationStateChangedInternal(RegistrationStateChangeEvent evt)
     {
-        if (started
-            && mucRoom == null
-            && evt.getNewState() == RegistrationState.REGISTERED)
+        if (started && mucRoom == null && evt.getNewState() == RegistrationState.REGISTERED)
         {
-            if (this.getAudioModeration() != null)
-            {
-                this.getAudioModeration().xmppProviderRegistered();
-            }
+            discoverComponentAddresses();
 
             // Join the MUC
             joinConferenceRoom();
@@ -677,22 +797,21 @@ public class JvbConference
                 Object sessionId = Util.getConnSessionId(connection);
                 if (sessionId != null)
                 {
-                    logger.error(this.callContext + " Registered bosh sid: "
-                        + sessionId);
+                    logger.error("Registered bosh sid: " + sessionId);
                 }
             }
         }
         else if (evt.getNewState() == RegistrationState.UNREGISTERED)
         {
-            logger.error(this.callContext + " Unregistered XMPP:" + evt);
+            logger.error("Unregistered XMPP:" + evt);
         }
         else if (evt.getNewState() == RegistrationState.REGISTERING)
         {
-            logger.info(this.callContext + " Registering XMPP.");
+            logger.info("Registering XMPP.");
         }
         else if (evt.getNewState() == RegistrationState.CONNECTION_FAILED)
         {
-            logger.error(this.callContext + " XMPP Connection failed. " + evt);
+            logger.error("XMPP Connection failed. " + evt);
 
             if (!connFailedStatsSent)
             {
@@ -724,7 +843,75 @@ public class JvbConference
         }
         else
         {
-            logger.info(this.callContext + evt.toString());
+            logger.info(evt);
+        }
+    }
+
+    /**
+     * Disco info the addresses, the query is cached and will be returned from cache
+     * once we retrieve it.
+     */
+    private void discoverComponentAddresses()
+    {
+        // we are here in the RegisterThread, and it is safe to query and wait
+        // Uses disco info to discover the AV moderation address.
+        // we need to query the domain part extracted from room jid
+        if (this.callContext.getRoomJidDomain() != null)
+        {
+            try
+            {
+                long startQuery = System.currentTimeMillis();
+
+                // in case when running unittests
+                if (this.getConnection() == null)
+                {
+                    return;
+                }
+
+                DiscoverInfo info = ServiceDiscoveryManager.getInstanceFor(this.getConnection())
+                        .discoverInfo(JidCreate.domainBareFrom(this.callContext.getRoomJidDomain()));
+
+                logger.info(String.format("Disco-info took %oms.", System.currentTimeMillis() - startQuery));
+
+                DiscoverInfo.Identity avIdentity = info.getIdentities().stream().
+                    filter(di -> di.getCategory().equals("component") && di.getType().equals("av_moderation"))
+                        .findFirst().orElse(null);
+
+                if (avIdentity != null && this.getAudioModeration() != null)
+                {
+                    String avModerationAddress = avIdentity.getName();
+                    this.getAudioModeration().setAvModerationAddress(avModerationAddress);
+                }
+
+                DiscoverInfo.Identity roomMetadataIdentity = info.getIdentities().stream().
+                        filter(di -> di.getCategory().equals("component") && di.getType().equals("room_metadata"))
+                        .findFirst().orElse(null);
+
+                // we process room metadata messages only when we are transcribing
+                if (roomMetadataIdentity != null && this.isTranscriber)
+                {
+                    getConnection().addAsyncStanzaListener(roomMetadataListener,
+                        new AndFilter(
+                            MessageTypeFilter.NORMAL,
+                            FromMatchesFilter.create(JidCreate.domainBareFrom(roomMetadataIdentity.getName()))));
+                }
+
+                DiscoverInfo.Identity visitorsIdentity = info.getIdentities().stream().
+                        filter(di -> di.getCategory().equals("component") && di.getType().equals("visitors"))
+                        .findFirst().orElse(null);
+
+                if (visitorsIdentity != null && !this.isTranscriber)
+                {
+                    getConnection().addAsyncStanzaListener(visitorsMessagesListener,
+                        new AndFilter(
+                            MessageTypeFilter.CHAT,
+                            FromMatchesFilter.create(JidCreate.domainBareFrom(visitorsIdentity.getName()))));
+                }
+            }
+            catch(Exception e)
+            {
+                logger.error("Error querying for av moderation address", e);
+            }
         }
     }
 
@@ -744,6 +931,15 @@ public class JvbConference
     public boolean isStarted()
     {
         return started;
+    }
+
+    /**
+     * Indicates whether this conference has been joined as visitor.
+     * @return <tt>true</tt> is this conference is joined as visitor, false otherwise.
+     */
+    public boolean isVisitor()
+    {
+        return this.isVisitor;
     }
 
     /**
@@ -776,48 +972,41 @@ public class JvbConference
             String roomName = callContext.getRoomJid().toString();
             String roomPassword = callContext.getRoomPassword();
 
-            logger.info(this.callContext + " Joining JVB conference room: " + roomName);
+            logger.info("Joining JVB conference room: " + roomName);
 
             mucRoom = muc.findRoom(roomName);
 
             if (mucRoom instanceof ChatRoomJabberImpl)
             {
+                ChatRoomJabberImpl chatRoom = (ChatRoomJabberImpl)mucRoom;
+
                 String displayName = gatewaySession.getMucDisplayName();
                 if (displayName != null)
                 {
-                    ((ChatRoomJabberImpl)mucRoom).addPresencePacketExtensions(
-                        new Nick(displayName));
+                    chatRoom.addPresencePacketExtensions(new Nick(displayName));
                 }
                 else
                 {
-                    logger.error(this.callContext
-                        + " No display name to use...");
+                    logger.error("No display name to use...");
                 }
 
-                String region = JigasiBundleActivator.getConfigurationService()
-                    .getString(LOCAL_REGION_PNAME);
+                String region = JigasiBundleActivator.getConfigurationService().getString(LOCAL_REGION_PNAME);
                 if (StringUtils.isNotEmpty(region))
                 {
                     JitsiParticipantRegionPacketExtension rpe = new JitsiParticipantRegionPacketExtension();
                     rpe.setRegionId(region);
 
-                    ((ChatRoomJabberImpl)mucRoom)
-                        .addPresencePacketExtensions(rpe);
+                    chatRoom.addPresencePacketExtensions(rpe);
                 }
 
-                ((ChatRoomJabberImpl)mucRoom)
-                    .addPresencePacketExtensions(
-                        new ColibriStatsExtension.Stat(
-                            ColibriStatsExtension.VERSION,
-                            CurrentVersionImpl.VERSION.getApplicationName()
-                                + " " + CurrentVersionImpl.VERSION));
+                chatRoom.addPresencePacketExtensions(new ColibriStatsExtension.Stat(
+                    ColibriStatsExtension.VERSION,
+                        CurrentVersionImpl.VERSION.getApplicationName() + " " + CurrentVersionImpl.VERSION));
 
                 // creates an extension to hold all headers, as when using
                 // addPresencePacketExtensions it requires unique extensions
                 // otherwise overrides them
-                AbstractPacketExtension initiator
-                    = new AbstractPacketExtension(
-                        SIP_GATEWAY_FEATURE_NAME, "initiator"){};
+                AbstractPacketExtension initiator = new AbstractPacketExtension(JIGASI_FEATURE_NAME, "initiator"){};
 
                 // let's add all extra headers from the context
                 callContext.getExtraHeaders().forEach(
@@ -831,16 +1020,30 @@ public class JvbConference
                     });
                 if (!initiator.getChildExtensions().isEmpty())
                 {
-                    ((ChatRoomJabberImpl)mucRoom).addPresencePacketExtensions(initiator);
+                    chatRoom.addPresencePacketExtensions(initiator);
                 }
 
-                ((ChatRoomJabberImpl)mucRoom).addPresencePacketExtensions(this.features);
+                // we want to add the features just before joining and after connecting
+                // to make sure EntityCapsManager.currentCapsVersion is properly initialized
+                chatRoom.addPresencePacketExtensions(this.features);
+
+                String statsId = JigasiBundleActivator.getConfigurationService().getString(STATS_ID_PNAME);
+                if (StringUtils.isNotEmpty(statsId))
+                {
+                    chatRoom.addPresencePacketExtensions(new StatsId(statsId));
+                }
+
+                if (this.isTranscriber)
+                {
+                    getConnection().addAsyncStanzaListener(
+                            presenceListener,
+                            new AndFilter(
+                                FromMatchesFilter.create(chatRoom.getIdentifierAsJid()), StanzaTypeFilter.PRESENCE));
+                }
             }
             else
             {
-                logger.error(this.callContext
-                    + " Cannot set presence extensions as chatRoom "
-                    + "is not an instance of ChatRoomJabberImpl");
+                logger.error("Cannot set presence extensions as chatRoom is not an instance of ChatRoomJabberImpl");
             }
 
             if (this.audioModeration != null)
@@ -848,12 +1051,56 @@ public class JvbConference
                 this.audioModeration.notifyWillJoinJvbRoom(mucRoom);
             }
 
-            // we invite focus and wait for its response
-            // to be sure that if it is not in the room, the focus will be the
-            // first to join, mimic the web behaviour
-            inviteFocus(JidCreate.entityBareFrom(mucRoom.getIdentifier()));
-
             Localpart resourceIdentifier = getResourceIdentifier();
+
+            // we are inviting focus when not a visitor, if we have received a response to join as a visitor
+            // we skip sending the request and just join as a visitor
+            if (!this.skipFocus)
+            {
+                // we invite focus and wait for its response
+                // to be sure that if it is not in the room, the focus will be the
+                // first to join, mimic the web behaviour
+                String vnode = inviteFocus(JidCreate.entityBareFrom(mucRoom.getIdentifier()));
+
+                if (vnode != null && !this.isTranscriber && JigasiBundleActivator.isSipVisitorsEnabled())
+                {
+                    this.isVisitor = true;
+                    this.skipFocus = true;
+                    this.oldRoom = this.callContext.getRoomJid().toString();
+                    String oldDomain = this.callContext.getDomain();
+                    String newDomain = vnode + ".meet.jitsi";
+
+                    this.xmppProvider.unregister(true); // let's recreate it after disconnect
+
+                    // remove old first
+                    this.xmppProvider.removeRegistrationStateChangeListener(this);
+
+                    logger.info("Removing account to prepare visitor " + this.xmppAccount);
+                    this.xmppProviderFactory.unloadAccount(this.xmppAccount);
+
+                    this.xmppProvider = null;
+
+                    // update domain with the predefined visitor's domain
+                    this.callContext.setRoomName(this.oldRoom.replaceAll(oldDomain, newDomain));
+
+                    // create a new account, it will match the domain for the userID from the room jid we updated
+                    Map<String, String> props = createAccountPropertiesForCallId(resourceIdentifier.toString());
+
+                    if (!Boolean.parseBoolean(props.get(JabberAccountID.ANONYMOUS_AUTH)))
+                    {
+                        // if there is authentication we want to use it but with the visitor's domain
+                        props.put(ProtocolProviderFactory.USER_ID,
+                            props.get(ProtocolProviderFactory.USER_ID).replace(oldDomain, newDomain));
+                    }
+
+                    this.oldBosh = this.xmppAccount.getAccountPropertyString(JabberAccountID.BOSH_URL);
+                    props.put(JabberAccountID.BOSH_URL, this.oldBosh + "&vnode=" + vnode);
+
+                    this.createAndLoadAccount(props);
+
+                    return;
+                }
+            }
 
             lobbyLocalpart = resourceIdentifier;
 
@@ -884,21 +1131,34 @@ public class JvbConference
 
             gatewaySession.notifyJvbRoomJoined();
 
-            if (lobbyEnabled)
+            if (websocketClient != null)
             {
-                // let's check room config
-                updateFromRoomConfiguration();
+                gatewaySession.notifyConferenceLive(true);
+                // websocketClient disconnects internally
+                websocketClient = null;
             }
 
             // let's listen for any future changes in room configuration, whether lobby will be enabled/disabled
-            if (roomConfigurationListener == null && mucRoom instanceof ChatRoomJabberImpl)
+            if (mucRoom instanceof ChatRoomJabberImpl)
             {
-                roomConfigurationListener = new RoomConfigurationChangeListener();
                 getConnection().addAsyncStanzaListener(roomConfigurationListener,
                     new AndFilter(
                         FromMatchesFilter.create(((ChatRoomJabberImpl)this.mucRoom).getIdentifierAsJid()),
                         MessageTypeFilter.GROUPCHAT));
+
+                if (this.isVisitor)
+                {
+                    this.visitorIqHandler = new VisitorIqHandler();
+                    getConnection().registerIQRequestHandler(this.visitorIqHandler);
+                }
             }
+
+            // let's check room config
+            updateFromRoomConfiguration();
+
+            logger.info("Joined room: " + roomName);
+
+            this.skipFocus = false;
         }
         catch (Exception e)
         {
@@ -955,8 +1215,7 @@ public class JvbConference
                                             this,
                                             (SipGatewaySession)this.gatewaySession);
 
-                                    logger.info(
-                                        callContext + " Lobby enabled by moderator! Will try to join lobby!");
+                                    logger.info("Lobby enabled by moderator! Will try to join lobby!");
 
                                     this.lobby.join();
 
@@ -966,15 +1225,26 @@ public class JvbConference
                                 }
                                 else
                                 {
-                                    logger.error(callContext + " No required lobby jid!");
+                                    logger.error("No required lobby jid!");
                                 }
                             }
                         }
                         catch(Exception ex)
                         {
-                            logger.error(callContext + " Failed to join lobby room!", ex);
+                            logger.error("Failed to join lobby room!", ex);
                         }
                     }
+                }
+                else if (opex.getErrorCode() == NOT_LIVE_ERROR_CODE)
+                {
+                    logger.info("Conference is not live yet.");
+
+                    gatewaySession.notifyConferenceLive(false);
+
+                    websocketClient = new WebsocketClient(this, visitorsQueueServiceUrl, this.callContext);
+                    websocketClient.connect();
+
+                    return;
                 }
             }
 
@@ -989,7 +1259,7 @@ public class JvbConference
                 }
             }
 
-            logger.error(this.callContext + " " + e.getMessage(), e);
+            logger.error(e.getMessage(), e);
 
             // inform that this session had failed
             gatewaySession.getGateway().fireGatewaySessionFailed(gatewaySession);
@@ -1025,7 +1295,7 @@ public class JvbConference
     {
         if (jvbCall == null)
         {
-            logger.warn(this.callContext + " JVB call already disposed");
+            logger.warn("JVB call already disposed");
             return;
         }
 
@@ -1041,8 +1311,7 @@ public class JvbConference
             }
             else
             {
-                logger.info(this.callContext
-                    + " Proceed with gwSession call on xmpp call hangup.");
+                logger.info("Proceed with gwSession call on xmpp call hangup.");
 
                 if (!gwSesisonWaitingStatsSent)
                 {
@@ -1073,15 +1342,12 @@ public class JvbConference
             = xmppProvider.getOperationSet(OperationSetMultiUserChat.class);
         muc.removePresenceListener(this);
 
-        if (this.roomConfigurationListener != null)
+        XMPPConnection connection = getConnection();
+        if (connection != null)
         {
-            XMPPConnection connection = getConnection();
-            if (connection != null)
-            {
-                connection.removeAsyncStanzaListener(roomConfigurationListener);
-            }
-
-            this.roomConfigurationListener = null;
+            connection.removeAsyncStanzaListener(roomConfigurationListener);
+            connection.removeAsyncStanzaListener(roomMetadataListener);
+            connection.removeAsyncStanzaListener(visitorsMessagesListener);
         }
 
         // remove listener needs to be after leave,
@@ -1134,7 +1400,7 @@ public class JvbConference
     {
         if (logger.isTraceEnabled())
         {
-            logger.trace(this.callContext + " Member presence change: " + evt);
+            logger.trace("Member presence change: " + evt);
         }
 
         ChatRoomMember member = evt.getChatRoomMember();
@@ -1146,6 +1412,8 @@ public class JvbConference
         {
             if (ChatRoomMemberPresenceChangeEvent.MEMBER_JOINED.equals(eventType))
             {
+                emptyTimeout.cancel();
+
                 gatewaySession.notifyChatRoomMemberJoined(member);
             }
             else if (ChatRoomMemberPresenceChangeEvent.MEMBER_UPDATED
@@ -1153,18 +1421,8 @@ public class JvbConference
             {
                 if (member instanceof ChatRoomMemberJabberImpl)
                 {
-                    Presence presence = ((ChatRoomMemberJabberImpl) member).getLastPresence();
-
-                    gatewaySession.notifyChatRoomMemberUpdated(member, presence);
-
-                    // let's check and whether it is a jigasi participant
-                    // we use initiator as its easier for checking/parsing
-                    if (presence != null
-                        && !jigasiChatRoomMembers.contains(member.getName())
-                        && presence.hasExtension("initiator", SIP_GATEWAY_FEATURE_NAME))
-                    {
-                        jigasiChatRoomMembers.add(member.getName());
-                    }
+                    gatewaySession.notifyChatRoomMemberUpdated(member,
+                        ((ChatRoomMemberJabberImpl) member).getLastPresence());
                 }
             }
 
@@ -1173,14 +1431,11 @@ public class JvbConference
         else
         {
             gatewaySession.notifyChatRoomMemberLeft(member);
-            logger.info(
-                this.callContext + " Member left : " + member.getRole()
-                            + " " + member.getContactAddress());
-
-            jigasiChatRoomMembers.remove(member.getName());
+            logger.info("Member left : " + member.getRole() + " " + member.getContactAddress());
 
             CallPeer peer;
-            if (jvbCall != null && (peer = jvbCall.getCallPeers().next()) instanceof MediaAwareCallPeer)
+            if (jvbCall != null && jvbCall.getCallPeerCount() > 0
+                    && (peer = jvbCall.getCallPeers().next()) instanceof MediaAwareCallPeer)
             {
                 MediaAwareCallPeer<?, ?, ?> peerMedia = (MediaAwareCallPeer<?, ?, ?>) peer;
                 peerMedia.getConferenceMembers().forEach(confMember ->
@@ -1198,7 +1453,7 @@ public class JvbConference
                         }
                         catch(Exception e)
                         {
-                            logger.error(this.callContext + " Error removing conference member=" + member.getName());
+                            logger.error("Error removing conference member=" + member.getName());
                         }
                     }
                 });
@@ -1227,7 +1482,7 @@ public class JvbConference
         // we leave this here before checking connection to make tests happy
         if (member.getName().equals(gatewaySession.getFocusResourceAddr()))
         {
-            logger.info(this.callContext + " Focus left! - stopping the call");
+            logger.info("Focus left! - stopping the call");
             CallManager.hangupCall(jvbCall, 502, "Focus left");
 
             return;
@@ -1248,19 +1503,20 @@ public class JvbConference
             boolean onlyJigasisInRoom = this.mucRoom.getMembers().stream().allMatch(m ->
                 m.getName().equals(getResourceIdentifier().toString()) // ignore if it is us
                 || m.getName().equals(gatewaySession.getFocusResourceAddr()) // ignore if it is jicofo
-                || jigasiChatRoomMembers.contains(m.getName()));
+                || (Util.isJigasi((ChatRoomMemberJabberImpl) m)
+                        && !Util.isTranscriberJigasi((ChatRoomMemberJabberImpl)m)));
 
             if (onlyJigasisInRoom)
             {
                 if (!this.allowOnlyJigasiInRoom)
                 {
-                    logger.info(this.callContext + " Leaving room without web users and only jigasi participants!");
+                    logger.info("Leaving room without web users and only jigasi participants!");
                     stop();
                     return;
                 }
 
                 // there are only jigasi participants in the room with lobby enabled
-                logger.info(this.callContext + " Leaving room with lobby enabled and only jigasi participants!");
+                logger.info("Leaving room with lobby enabled and only jigasi participants!");
 
                 // let's play something
                 if (this.gatewaySession instanceof SipGatewaySession)
@@ -1274,6 +1530,24 @@ public class JvbConference
                     // transcriber case
                     stop();
                 }
+
+                return;
+            }
+        }
+
+        if (JvbConference.this.isTranscriber)
+        {
+            // make sure we hangup transcriber if only backend services are in the room - Jibri/Jigasi
+            // (maybe a second transcriber if there is some glitch in the system).
+            boolean onlyBotsInRoom = this.mucRoom.getMembers().stream().allMatch(m ->
+                    m.getName().equals(getResourceIdentifier().toString()) // ignore if it is us
+                            || m.getName().equals(gatewaySession.getFocusResourceAddr()) // ignore if it is jicofo
+                            || Util.isTranscriberJigasi((ChatRoomMemberJabberImpl)m)
+                            || Util.isJibri((ChatRoomMemberJabberImpl)m));
+
+            if (onlyBotsInRoom)
+            {
+                emptyTimeout.scheduleTimeout(AbstractGateway.getEmptyCallTimeout());
             }
         }
     }
@@ -1303,7 +1577,7 @@ public class JvbConference
         }
         catch (Exception ex)
         {
-            logger.error(callContext + " " + ex, ex);
+            logger.error(ex.toString(), ex);
         }
     }
 
@@ -1391,7 +1665,7 @@ public class JvbConference
     @Override
     public void onSessionStartMuted(boolean[] startMutedFlags)
     {
-        xmppInvokeQueue.add(() -> this.gatewaySession.onSessionStartMuted(startMutedFlags));
+        // Not used.
     }
 
     @Override
@@ -1415,8 +1689,7 @@ public class JvbConference
             String peerAddress;
             if (peer == null || peer.getAddress() == null)
             {
-                logger.error(callContext
-                    + " Failed to obtain focus peer address");
+                logger.error(" Failed to obtain focus peer address");
                 peerAddress = null;
             }
             else
@@ -1426,8 +1699,7 @@ public class JvbConference
                     = fullAddress.substring(
                             fullAddress.indexOf("/") + 1);
 
-                logger.info(callContext
-                    + " Got invite from " + peerAddress);
+                logger.info("Got invite from " + peerAddress);
             }
 
             if (peerAddress == null
@@ -1435,8 +1707,7 @@ public class JvbConference
             {
                 if (logger.isTraceEnabled())
                 {
-                    logger.trace(callContext +
-                        " Calls not initiated from focus are not allowed");
+                    logger.trace("Calls not initiated from focus are not allowed");
                 }
 
                 CallManager.hangupCall(event.getSourceCall(),
@@ -1446,8 +1717,7 @@ public class JvbConference
 
             if (jvbCall != null)
             {
-                logger.error(callContext +
-                    " JVB conference call already started ");
+                logger.error("JVB conference call already started ");
                 CallManager.hangupCall(event.getSourceCall(),
                     200, "Call completed elsewhere");
                 return;
@@ -1455,7 +1725,7 @@ public class JvbConference
 
             if (!started || xmppProvider == null)
             {
-                logger.error(callContext + " Instance disposed");
+                logger.error("Instance disposed");
                 return;
             }
 
@@ -1491,8 +1761,15 @@ public class JvbConference
             // disable hole punching jvb
             if (peer instanceof MediaAwareCallPeer)
             {
-                ((MediaAwareCallPeer)peer).getMediaHandler()
-                    .setDisableHolePunching(true);
+                CallPeerMediaHandler peerMediaHandler = ((MediaAwareCallPeer)peer).getMediaHandler();
+
+                peerMediaHandler.setDisableHolePunching(true);
+
+                if (isVisitor)
+                {
+                    // no sources when visitor, or we get rejection from jicofo
+                    peerMediaHandler.setLocalAudioTransmissionEnabled(false);
+                }
             }
 
             jvbCall.addCallChangeListener(callChangeListener);
@@ -1520,15 +1797,13 @@ public class JvbConference
         {
             if (jvbCall != evt.getSourceCall())
             {
-                logger.error(
-                    callContext + " Call change event for different call ? "
-                        + evt.getSourceCall() + " : " + jvbCall);
+                logger.error("Call change event for different call ? " + evt.getSourceCall() + " : " + jvbCall);
                 return;
             }
 
             if (jvbCall.getCallState() == CallState.CALL_IN_PROGRESS)
             {
-                logger.info(callContext + " JVB conference call IN_PROGRESS.");
+                logger.info("JVB conference call IN_PROGRESS.");
                 gatewaySession.onJvbCallEstablished();
 
                 AudioModeration avMod = JvbConference.this.getAudioModeration();
@@ -1547,19 +1822,19 @@ public class JvbConference
     }
 
     /**
-     * FIXME: temporary
+     * Generates new account properties.
      */
-    private Map<String, String> createAccountPropertiesForCallId(CallContext ctx, String resourceName)
+    private Map<String, String> createAccountPropertiesForCallId(String nodePart)
     {
         HashMap<String, String> properties = new HashMap<>();
 
-        String domain = ctx.getRoomJidDomain();
+        String domain = this.callContext.getRoomJidDomain();
 
-        properties.put(ProtocolProviderFactory.USER_ID, resourceName + "@" + domain);
+        properties.put(ProtocolProviderFactory.USER_ID, nodePart + "@" + domain);
         properties.put(ProtocolProviderFactory.SERVER_ADDRESS, domain);
         properties.put(ProtocolProviderFactory.SERVER_PORT, "5222");
 
-        properties.put(ProtocolProviderFactory.RESOURCE, resourceName);
+        properties.put(ProtocolProviderFactory.RESOURCE, nodePart);
         properties.put(ProtocolProviderFactory.AUTO_GENERATE_RESOURCE, "false");
         properties.put(ProtocolProviderFactory.RESOURCE_PRIORITY, "30");
 
@@ -1655,9 +1930,9 @@ public class JvbConference
             {
                 // do not override boshURL with the global setting if
                 // we already have a value
-                if (StringUtils.isEmpty(ctx.getBoshURL()))
+                if (StringUtils.isEmpty(this.callContext.getBoshURL()))
                 {
-                    ctx.setBoshURL(value);
+                    this.callContext.setBoshURL(value);
                 }
             }
             else if ("org.jitsi.jigasi.xmpp.acc.USER_ID".equals(overridenProp)
@@ -1687,32 +1962,42 @@ public class JvbConference
             }
         }
 
-        String boshUrl = ctx.getBoshURL();
+        String boshUrl = this.callContext.getBoshURL();
         if (StringUtils.isNotEmpty(boshUrl))
         {
-            boshUrl = boshUrl.replace(
-                "{roomName}", callContext.getConferenceName());
+            boshUrl = boshUrl.replace("{roomName}", this.callContext.getConferenceName());
 
-            logger.info(ctx + " Using bosh url:" + boshUrl);
+            try
+            {
+                // Make sure we encode the roomName parameter
+                URIBuilder encodedUrlBuilder = new URIBuilder(boshUrl);
+                encodedUrlBuilder.setParameter("room", this.callContext.getConferenceName());
+                boshUrl = encodedUrlBuilder.build().toURL().toString();
+            }
+            catch (URISyntaxException | MalformedURLException e)
+            {
+                logger.error("Cannot encode bosh url param room", e);
+            }
+
+            logger.info("Using bosh url:" + boshUrl);
             properties.put(JabberAccountID.BOSH_URL, boshUrl);
 
-            if (ctx.hasAuthToken() &&  ctx.getAuthUserId() != null)
+            if (this.callContext.hasAuthToken() &&  this.callContext.getAuthUserId() != null)
             {
-                properties.put(ProtocolProviderFactory.USER_ID, ctx.getAuthUserId());
+                properties.put(ProtocolProviderFactory.USER_ID, this.callContext.getAuthUserId());
             }
         }
 
         // Necessary when doing authenticated XMPP login, otherwise the dynamic
         // accounts get assigned the same ACCOUNT_UID which leads to problems.
-        String accountUID = "Jabber:" + properties.get(ProtocolProviderFactory.USER_ID) + "/" + resourceName;
+        String accountUID = "Jabber:" + properties.get(ProtocolProviderFactory.USER_ID) + "/" + nodePart;
         properties.put(ProtocolProviderFactory.ACCOUNT_UID, accountUID);
 
         // Because some AbstractGatewaySessions needs access to the audio,
         // we can't always use translator
         if (!gatewaySession.isTranslatorSupported())
         {
-            properties.put(ProtocolProviderFactory.USE_TRANSLATOR_IN_CONFERENCE,
-                "false");
+            properties.put(ProtocolProviderFactory.USE_TRANSLATOR_IN_CONFERENCE, "false");
         }
 
         return properties;
@@ -1764,19 +2049,28 @@ public class JvbConference
      * Sends invite to jicofo to join a room.
      *
      * @param roomIdentifier the room to join
+     * @return Returns vnode if one exist in focus response.
      */
-    private void inviteFocus(final EntityBareJid roomIdentifier)
+    private String inviteFocus(final EntityBareJid roomIdentifier)
+        throws OperationFailedException
     {
         if (callContext == null || callContext.getRoomJidDomain() == null)
         {
-            logger.error(this.callContext
-                + " No domain name info to use for inviting focus!"
-                + " Please set DOMAIN_BASE to the sip account.");
-            return;
+            logger.error("No domain name info to use for inviting focus! Please set DOMAIN_BASE to the sip account.");
+            return null;
         }
 
         ConferenceIq focusInviteIQ = new ConferenceIq();
         focusInviteIQ.setRoom(roomIdentifier);
+
+        if (JigasiBundleActivator.isSipVisitorsEnabled() && !this.isTranscriber)
+        {
+            focusInviteIQ.addProperty("visitors-version", "1");
+            if (callContext.isRequestVisitor())
+            {
+                focusInviteIQ.addProperty("visitor", Boolean.TRUE.toString());
+            }
+        }
 
         try
         {
@@ -1787,9 +2081,8 @@ public class JvbConference
         }
         catch (XmppStringprepException e)
         {
-            logger.error(this.callContext +
-                " Could not create destination address for focus invite", e);
-            return;
+            logger.error("Could not create destination address for focus invite", e);
+            return null;
         }
 
         // this check just skips an exception when running tests
@@ -1798,16 +2091,24 @@ public class JvbConference
             StanzaCollector collector = null;
             try
             {
-                collector = getConnection()
-                    .createStanzaCollectorAndSend(focusInviteIQ);
-                collector.nextResultOrThrow();
+                collector = getConnection().createStanzaCollectorAndSend(focusInviteIQ);
+                ConferenceIq res = collector.nextResultOrThrow();
+
+                if (visitorsQueueServiceUrl != null)
+                {
+                    String liveValue = res.getPropertiesMap().get("live");
+                    if (liveValue != null && !Boolean.parseBoolean(liveValue))
+                    {
+                        throw new OperationFailedException("Not live conference", NOT_LIVE_ERROR_CODE);
+                    }
+                }
+                return res.getVnode();
             }
             catch (SmackException
                 | XMPPException.XMPPErrorException
                 | InterruptedException e)
             {
-                logger.error(this.callContext +
-                    " Could not invite the focus to the conference", e);
+                logger.error("Could not invite the focus to the conference", e);
             }
             finally
             {
@@ -1817,6 +2118,8 @@ public class JvbConference
                 }
             }
         }
+
+        return null;
     }
 
     /**
@@ -1871,7 +2174,7 @@ public class JvbConference
         // Check if conference joined before trying...
         if (this.mucRoom != null)
         {
-            logger.warn(this.callContext + " Strange received a password after joining the room");
+            logger.warn("Strange received a password after joining the room");
             return;
         }
 
@@ -1901,24 +2204,15 @@ public class JvbConference
      */
     private String getMeetingId()
     {
+        // in case when running unittests
+        if (this.getConnection() == null)
+        {
+            return null;
+        }
+
         if (this.meetingId == null)
         {
-            try
-            {
-                DiscoverInfo info = ServiceDiscoveryManager.getInstanceFor(getConnection())
-                    .discoverInfo(((ChatRoomJabberImpl) this.mucRoom).getIdentifierAsJid());
-
-                DataForm df = (DataForm) info.getExtension(DataForm.NAMESPACE);
-                FormField meetingIdField = df.getField(DATA_FORM_MEETING_ID_FIELD_NAME);
-                if (meetingIdField != null)
-                {
-                    this.meetingId = meetingIdField.getFirstValue();
-                }
-            }
-            catch (Exception e)
-            {
-                logger.error(this.callContext + " Error checking room configuration", e);
-            }
+            updateFromRoomConfiguration();
         }
 
         return this.meetingId;
@@ -1930,20 +2224,226 @@ public class JvbConference
      */
     private void updateFromRoomConfiguration()
     {
+        // in case when running unittests
+        if (this.getConnection() == null)
+        {
+            return;
+        }
+
         try
         {
             DiscoverInfo info = ServiceDiscoveryManager.getInstanceFor(getConnection()).
                 discoverInfo(((ChatRoomJabberImpl)this.mucRoom).getIdentifierAsJid());
 
             DataForm df = (DataForm) info.getExtension(DataForm.NAMESPACE);
-            boolean lobbyEnabled = df.getField(Lobby.DATA_FORM_LOBBY_ROOM_FIELD) != null;
-            boolean singleModeratorEnabled = df.getField(Lobby.DATA_FORM_SINGLE_MODERATOR_FIELD) != null;
+            boolean lobbyEnabled = df.getField(DATA_FORM_LOBBY_ROOM_FIELD) != null;
             setLobbyEnabled(lobbyEnabled);
-            this.singleModeratorEnabled = singleModeratorEnabled;
+
+            this.singleModeratorEnabled = df.getField(DATA_FORM_SINGLE_MODERATOR_FIELD) != null;
+
+            FormField roomMetadata = df.getField(DATA_FORM_ROOM_METADATA_FIELD);
+            if (roomMetadata != null)
+            {
+                List<String> roomMetadataValues = roomMetadata.getValuesAsString();
+                if (roomMetadataValues != null && !roomMetadataValues.isEmpty())
+                {
+                    // it is supposed to have a single value
+                    processRoomMetadataJson(roomMetadataValues.get(0));
+                }
+            }
+
+            FormField meetingIdField = df.getField(DATA_FORM_MEETING_ID_FIELD_NAME);
+            if (meetingIdField != null)
+            {
+                this.meetingId = meetingIdField.getFirstValue();
+                logger.info("Meeting id: " + meetingId);
+            }
         }
         catch(Exception e)
         {
-            logger.error(this.callContext + " Error checking room configuration", e);
+            logger.error("Error checking room configuration", e);
+        }
+    }
+
+    private void processRoomMetadataJson(String json)
+    {
+        JSONObject metadataObj = null;
+
+        try
+        {
+            Object o = new JSONParser().parse(json);
+
+            if (o instanceof JSONObject)
+            {
+                JSONObject data = (JSONObject) o;
+
+                if (data.get("type").equals("room_metadata"))
+                {
+                    metadataObj = (JSONObject)data.getOrDefault("metadata", new JSONObject());
+                }
+            }
+        }
+        catch(Exception e)
+        {
+            logger.error("Error parsing", e);
+        }
+
+        if (metadataObj == null)
+        {
+            logger.warn("No room metadata found");
+            return;
+        }
+
+        if (!this.isTranscriber)
+        {
+            JSONObject startMutedObj = (JSONObject)metadataObj.get("startMuted");
+
+            if (startMutedObj != null)
+            {
+                Object startAudioMuted = startMutedObj.get("audio");
+                if (startAudioMuted == null)
+                {
+                    return;
+                }
+
+                boolean startMuted = (Boolean)startMutedObj.get("audio");
+
+                logger.info("Received start audio muted:" + startMuted);
+
+                xmppInvokeQueue.add(() -> this.getAudioModeration().setStartAudioMuted(startMuted));
+            }
+
+            return;
+        }
+
+        TranscriptionGatewaySession transcriptionSession = (TranscriptionGatewaySession)this.gatewaySession;
+
+        JSONObject recordingObj = (JSONObject)metadataObj.getOrDefault("recording", new JSONObject());
+        transcriptionSession.setBackendTranscribingEnabled(
+                (boolean)recordingObj.getOrDefault("isTranscribingEnabled", false));
+
+        JSONObject visitorsObj = (JSONObject)metadataObj.getOrDefault("visitors", new JSONObject());
+        String languages = (String)visitorsObj.getOrDefault("transcribingLanguages", "");
+        if (StringUtils.isNotEmpty(languages))
+        {
+            transcriptionSession.updateTranslateLanguages(languages.split(","));
+        }
+
+        Object count = visitorsObj.get("transcribingCount");
+        if (count != null)
+        {
+            transcriptionSession.setVisitorsCountRequestingTranscription((Long)count);
+        }
+    }
+
+    /**
+     * Process received demote request. Leaves the current room and keeps the connection
+     * as we will send the invite to jicofo with the request to be visitor.
+     * After the response the visitor's logic will kick in with disconnecting and connecting to the visitor's node.
+     * @param json The received json.
+     */
+    private void processVisitorsJson(String json)
+    {
+        try
+        {
+            Object o = new JSONParser().parse(json);
+
+            if (o instanceof JSONObject)
+            {
+                JSONObject data = (JSONObject) o;
+
+                if (data.get("type").equals("visitors")
+                    && data.get("action").equals("demote-request")
+                    && data.get("id").equals(this.mucRoom.getUserNickname()))
+                {
+                    logger.info("Received demote request to become visitor from: " + data.get("actor"));
+
+                    this.leaveConferenceRoom();
+
+                    this.callContext.setRequestVisitor(true);
+
+                    logger.info("Will join requesting to be visitor.");
+                    this.joinConferenceRoom();
+                }
+            }
+        }
+        catch(Exception e)
+        {
+            logger.error("Error parsing", e);
+        }
+    }
+
+    /**
+     * Send a message to the muc room
+     *
+     * @param messageString the message to send
+     */
+    public void sendMessageToRoom(String messageString)
+    {
+        xmppSendQueue.add(() -> sendMessageToRoomInternal(messageString));
+    }
+
+    public void sendMessageToRoomInternal(String messageString)
+    {
+        if (!isInTheRoom())
+        {
+            logger.error("Cannot send message as chatRoom is null");
+            return;
+        }
+
+        try
+        {
+            this.mucRoom.sendMessage(this.mucRoom.createMessage(messageString));
+            if (logger.isTraceEnabled())
+            {
+                logger.trace("Sending message: \"" + messageString + "\"");
+            }
+        }
+        catch (OperationFailedException e)
+        {
+            logger.warn("Failed to send message " + messageString, e);
+        }
+    }
+
+    /**
+     * Send a json-message to the muc room
+     *
+     * @param jsonMessage the json message to send
+     */
+    public void sendJsonMessage(JSONObject jsonMessage)
+    {
+        xmppSendQueue.add(() -> sendJsonMessageInternal(jsonMessage));
+    }
+
+    private void sendJsonMessageInternal(JSONObject jsonMessage)
+    {
+        if (this.mucRoom == null)
+        {
+            logger.error("Cannot send message as chatRoom is null");
+            return;
+        }
+
+        if (!isInTheRoom())
+        {
+            if (logger.isDebugEnabled())
+            {
+                logger.debug("Skip sending message to room which we left!");
+            }
+            return;
+        }
+
+        String messageString = jsonMessage.toString();
+        try
+        {
+            ((ChatRoomJabberImpl)this.mucRoom).sendJsonMessage(messageString);
+            if (logger.isTraceEnabled())
+            {
+                logger.trace("Sending json message: \"" + messageString + "\"");
+            }
+        }
+        catch (OperationFailedException e)
+        {
+            logger.warn("Failed to send json message " + messageString, e);
         }
     }
 
@@ -2005,7 +2505,7 @@ public class JvbConference
                 timeoutThread = new Thread(this, name);
                 willCauseTimeout = true;
                 timeoutThread.start();
-                logger.debug(callContext + " Scheduled new " + this);
+                logger.debug("Scheduled new " + this);
             }
         }
 
@@ -2026,8 +2526,7 @@ public class JvbConference
 
             if (willCauseTimeout)
             {
-                logger.error(callContext + " "
-                    + errorLog + " (" + timeout + " ms)");
+                logger.error(errorLog + " (" + timeout + " ms)");
 
                 JvbConference.this.endReason = this.endReason;
                 JvbConference.this.endReasonCode
@@ -2090,8 +2589,7 @@ public class JvbConference
         @Override
         public String toString()
         {
-            return "JvbConferenceStopTimeout[" + callContext
-                + ", willCauseTimeout:" + willCauseTimeout + " details:"
+            return "JvbConferenceStopTimeout[willCauseTimeout:" + willCauseTimeout + " details:"
                 + (willCauseTimeout ? endReason + "," + errorLog: "")
                 + "]@"+ hashCode();
         }
@@ -2124,6 +2622,140 @@ public class JvbConference
     }
 
     /**
+     * When a room metadata change is received.
+     */
+    private class RoomMetadataListener
+        implements StanzaListener
+    {
+        @Override
+        public void processStanza(Stanza stanza)
+        {
+            JsonMessageExtension jsonMsg = stanza.getExtension(JsonMessageExtension.class);
+
+            if (jsonMsg == null)
+            {
+                return;
+            }
+
+            processRoomMetadataJson(jsonMsg.getJson());
+        }
+    }
+
+    /**
+     * Handles visitor iq requests received by jigasi.
+     * If promoted, we hangup call and remove the registered account.
+     * The ServiceListener waits for the xmpp account to be removed, before connecting
+     * to the main room.
+     */
+    private class VisitorIqHandler
+        extends AbstractIqRequestHandler
+    {
+        public VisitorIqHandler()
+        {
+            super(VisitorsIq.ELEMENT, VisitorsIq.NAMESPACE, IQ.Type.set, Mode.async);
+        }
+
+        @Override
+        public IQ handleIQRequest(IQ iqRequest)
+        {
+            VisitorsIq visitorsIq = (VisitorsIq) iqRequest;
+
+            VisitorsPromotionResponseExtension promotionResponse
+                    = visitorsIq.getExtension(VisitorsPromotionResponseExtension.class);
+
+            if (promotionResponse != null && promotionResponse.isAllowed())
+            {
+                if (JvbConference.this.gatewaySession instanceof SipGatewaySession)
+                {
+                    try
+                    {
+                        ((SipGatewaySession) JvbConference.this.gatewaySession)
+                            .sendJson(SipInfoJsonProtocol.createSIPCallVisitors(false));
+                    }
+                    catch (OperationFailedException e)
+                    {
+                        logger.error("Failed to send visitor update via sip", e);
+                    }
+                }
+                // let's reconnect to the main prosody
+                try
+                {
+                    leaveConferenceRoom();
+
+                    // we will wait for the provider unregister event before proceeding with the new connection
+                    JigasiBundleActivator.osgiContext.addServiceListener(new ServiceListener()
+                    {
+                        @Override
+                        public void serviceChanged(ServiceEvent serviceEvent)
+                        {
+                            if (serviceEvent.getType() != ServiceEvent.UNREGISTERING)
+                            {
+                                return;
+                            }
+
+                            ServiceReference<?> ref = serviceEvent.getServiceReference();
+
+                            Object service = JigasiBundleActivator.osgiContext.getService(ref);
+
+                            if (!(service instanceof ProtocolProviderService)
+                                    || !JvbConference.this.xmppProvider.equals(service))
+                            {
+                                return;
+                            }
+
+                            JigasiBundleActivator.osgiContext.removeServiceListener(this);
+
+                            JvbConference.this.xmppProvider.removeRegistrationStateChangeListener(JvbConference.this);
+                            JvbConference.this.xmppProvider = null;
+
+                            try
+                            {
+                                JvbConference.this.callContext.setRoomName(JvbConference.this.oldRoom);
+
+                                Localpart resourceIdentifier = getResourceIdentifier();
+
+                                // create a new account, it will match the domain for the userID from the room jid we
+                                // just updated
+                                Map<String, String> props
+                                    = createAccountPropertiesForCallId(resourceIdentifier.toString());
+
+                                props.put(JabberAccountID.BOSH_URL,
+                                    JvbConference.this.oldBosh + "&customusername=" + promotionResponse.getUsername());
+
+                                JvbConference.this.oldBosh = null;
+                                JvbConference.this.oldRoom = null;
+                                JvbConference.this.isVisitor = false;
+                                JvbConference.this.skipFocus = true;
+
+                                JvbConference.this.createAndLoadAccount(props);
+                            }
+                            catch (XmppStringprepException e)
+                            {
+                                throw new RuntimeException(e);
+                            }
+                        }
+                    });
+
+                    if (jvbCall != null)
+                    {
+                        CallManager.hangupCall(jvbCall, true);
+                    }
+                }
+                catch (Exception e)
+                {
+                    throw new RuntimeException(e);
+                }
+            }
+            else
+            {
+                logger.info("Missing extension or promotion denied: " + promotionResponse);
+            }
+
+            return IQ.createResultIQ(visitorsIq);
+        }
+    }
+
+    /**
      * Used to check the jvb side of the call for any activity.
      */
     private class MediaActivityChecker
@@ -2133,9 +2765,9 @@ public class JvbConference
         public void run()
         {
             // if the call was stopped before we check ignore
-            if (!started)
+            if (!started || jvbCall == null)
             {
-                logger.warn("Media activity checker exiting early as call is not started!");
+                logger.warn("Media activity checker exiting early as call is not started or jvbCall is stopped!");
                 return;
             }
 
@@ -2190,9 +2822,63 @@ public class JvbConference
         private void dropCall()
         {
             Statistics.incrementTotalCallsJvbNoMedia();
-            logger.error(callContext + " No activity on JVB conference call will stop");
+            logger.error("No activity on JVB conference call will stop");
 
             stop();
+        }
+    }
+
+    /**
+     * Listening for visitor's messages.
+     */
+    private class VisitorsMessagesListener
+            implements StanzaListener
+    {
+        @Override
+        public void processStanza(Stanza stanza)
+        {
+            JsonMessageExtension jsonMsg = stanza.getExtension(JsonMessageExtension.class);
+
+            if (jsonMsg == null)
+            {
+                return;
+            }
+
+            processVisitorsJson(jsonMsg.getJson());
+        }
+    }
+
+    /**
+     * Listens for presence packets.
+     */
+    private class ChatRoomPresenceListener
+        implements StanzaListener
+    {
+        /**
+         * Processes an incoming presence packet.
+         * @param packet the incoming packet.
+         */
+        @Override
+        public void processStanza(Stanza packet)
+        {
+            if (!(packet instanceof Presence) || packet.getError() != null)
+            {
+                logger.warn("Unable to handle packet: " + packet);
+                return;
+            }
+
+            Presence presence = (Presence) packet;
+            if (MUCUserStatusCodeFilter.STATUS_110_PRESENCE_TO_SELF.accept(presence))
+            {
+                getConnection().removeAsyncStanzaListener(this);
+            }
+            else if (Util.isTranscriberJigasi(presence))
+            {
+                getConnection().removeAsyncStanzaListener(this);
+
+                logger.warn("Detected another transcriber in the room, will leave!");
+                stop();
+            }
         }
     }
 }
